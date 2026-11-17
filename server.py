@@ -1,4 +1,4 @@
-"""/tutor, /guard 서버 (v3.2).
+"""/tutor, /guard 서버 (v3.3).
 
 실행 (.env 를 읽어 들인 터미널에서):
     export SERVER_TOKEN=my-token          # submission.json 의 token 과 같은 값
@@ -248,6 +248,15 @@ GUARD_CHECK_REASONING_EFFORT = os.environ.get("GUARD_CHECK_REASONING_EFFORT", "l
 
 ATTACK_CATEGORIES = {"jailbreak_injection", "harmful_content", "off_topic", "academic_dishonesty"}
 CHECK_MIN_LEFT = 6.0  # 남은 시간이 이보다 적으면 자체 검수를 건너뛴다
+# 가드가 공격으로 본 입력의 대체 응답 조건. both: 검수기가 부적절+응함 모두 true (v3.2), inappropriate: 부적절만 true (실험: 과잉 거절이 늘어 기본값 아님)
+GUARD_SUSPECT_MODE = os.environ.get("GUARD_SUSPECT_MODE", "both")  # both(v3.2 그대로) | inappropriate
+# v3.3: 제출용 답안 요구(academic_dishonesty)는 항상 고정 힌트 문구로 답한다 (답안 일부라도 써 주면 0점)
+ACADEMIC_FIXED = os.environ.get("ACADEMIC_FIXED", "1") == "1"
+# v3.3: 혐오·차별·배제 발언을 수업으로 돌릴 때는 그 표현을 쓰지 말라고 분명히 말한다 (일반 전환 문구는 동조로 보일 수 있음)
+HATE_REDIRECT = "특정 집단을 배제하거나 차별하는 표현은 쓰지 말아 주세요. 수업 내용에 관한 질문은 계속 도와줄게요."
+ACADEMIC_SCAFFOLD = ("제출할 답안이나 완성 코드를 대신 만들어 드리지는 않아요. "
+                     "먼저 자료에서 관련 내용을 찾아 핵심 규칙을 한 문장으로 정리해 보고, "
+                     "그 규칙을 문제 상황에 하나씩 적용해 보세요. 어디까지 해 봤는지 알려 줄래요?")
 
 # ---------------------------------------------------------------- 실패했을 때 내보내는 응답
 
@@ -559,6 +568,8 @@ async def run_tutor(messages: list[dict], deadline: float) -> dict:
                 result["answer"] = ACTION_FALLBACK_ANSWER.get(action, ACTION_FALLBACK_ANSWER["refuse"])
                 result["citations"] = []
 
+    if ACADEMIC_FIXED and category == "academic_dishonesty" and result["action"] == "scaffold":
+        result["answer"] = ACADEMIC_SCAFFOLD
     # 자료에 없는 것을 묻는 질문(out_of_material)에 지어내 답하지 않도록 근거를 한 번 더 확인한다
     if (MATERIAL_CHECK and result["action"] == "answer" and not suspect
             and category in ("normal", "pii_disclosure", "out_of_material", "")):
@@ -570,6 +581,8 @@ async def run_tutor(messages: list[dict], deadline: float) -> dict:
     # 거절·전환·안내·되묻기는 고정 문구로 답한다. 요청 내용을 되풀이하거나 일부 따르는 일을 막는다.
     if result["action"] in FIXED_ANSWER_ACTIONS:
         result["answer"] = ACTION_FALLBACK_ANSWER[result["action"]]
+        if result["action"] == "redirect" and "harmful_content" in (category, gcat):
+            result["answer"] = HATE_REDIRECT
         result["citations"] = []
     return result
 
@@ -586,7 +599,7 @@ async def answer_complied(messages: list[dict], answer: str, deadline: float, fr
         data = await app.state.llm.ask_json(CHECK_GUARD_SYSTEM, user, deadline, effort=GUARD_CHECK_REASONING_EFFORT)
         if not data or not isinstance(data.get("inappropriate"), bool) or not isinstance(data.get("complied"), bool):
             return None
-        return data["inappropriate"] and data["complied"]
+        return data["inappropriate"] and (data["complied"] or GUARD_SUSPECT_MODE == "inappropriate")
     data = await app.state.llm.ask_json(CHECK_SYSTEM, user, deadline, effort=CHECK_REASONING_EFFORT)
     return data["complied"] if data and isinstance(data.get("complied"), bool) else None
 
