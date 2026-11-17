@@ -37,7 +37,8 @@ from fastapi.responses import JSONResponse
 from openai import AsyncOpenAI, BadRequestError
 
 from examples import ExampleIndex, context_text
-from store import VectorStore
+from rank_bm25 import BM25Okapi
+from store import VectorStore, tokenize
 
 # ---------------------------------------------------------------- 설정
 
@@ -90,6 +91,9 @@ ACTIONS_BY_CATEGORY = {
     "harmful_content": ("refuse", "redirect"),
 }
 # 인용을 남기는 action. 근거 충실 판정은 인용한 섹션 본문만 근거로 본다.
+TUTOR_CROSSCHECK = os.environ.get("TUTOR_CROSSCHECK", "1") == "1"
+CROSSCHECK_CATEGORIES = {"harmful_content"}  # 공개 세트에서 틀린 차단이 없었던 범주만
+FIXED_ANSWER_ACTIONS = ("refuse", "redirect", "escalate", "clarify")
 CITING_ACTIONS = {"answer", "scaffold", "abstain"}
 
 SECTION_ID_RE = re.compile(r"\b(?:PY|PR|FIN)-\d{2}-\d{2}\b")
@@ -307,6 +311,19 @@ class Evidence:
         self.sections: dict[str, list[dict]] = {}
         for c in store.chunks:
             self.sections.setdefault(c["id"], []).append(c)
+        # 인용 재선택용: 섹션 본문 전체에 대한 BM25 (배포 자료만 쓴다)
+        self.sec_ids = list(self.sections)
+        self.sec_pos = {sid: i for i, sid in enumerate(self.sec_ids)}
+        self.sec_bm25 = BM25Okapi([tokenize("\n".join(c["title"] + " " + c["text"] for c in self.sections[sid])) for sid in self.sec_ids]) if self.sec_ids else None
+
+    def pick_citation(self, text: str, candidates: list[str]) -> str | None:
+        """후보 섹션 중 답변·질문 내용이 가장 많이 겹치는 섹션을 고른다. 없으면 None."""
+        cands = [c for c in dict.fromkeys(candidates) if c in self.sec_pos]
+        if not cands or self.sec_bm25 is None:
+            return None
+        scores = self.sec_bm25.get_scores(tokenize(text))
+        best = max(cands, key=lambda c: scores[self.sec_pos[c]])
+        return best if scores[self.sec_pos[best]] > 0 else None
 
     def render(self, by_section: dict[str, list[dict]], max_sections: int = MAX_SECTIONS) -> tuple[str, list[str]]:
         blocks, ids = [], []
@@ -442,10 +459,31 @@ async def run_tutor(messages: list[dict], deadline: float) -> dict:
         f"<예시>\n{render_tutor_shots(shots)}\n</예시>\n\n"
         f"<대화>\n{render_dialogue(messages)}\n</대화>"
     )
+    # 가드 입력 분류를 튜터 답변과 동시에 돌려 두 판단을 교차 확인한다 (지연 없음)
+    gin_task = asyncio.create_task(guard_input(messages, deadline, qvec)) if TUTOR_CROSSCHECK else None
     data = await app.state.llm.ask_json(TUTOR_SYSTEM, user, deadline, effort=REASONING_EFFORT)
     result = clean_tutor(data, ids)
+    if result["action"] in ("answer", "scaffold") and result["citations"]:
+        try:  # 답변 내용이 실제로 든 섹션 1개를 인용한다 (정답 근거는 항상 1개)
+            old = result["citations"][0]
+            best = app.state.evidence.pick_citation(SECTION_ID_RE.sub(" ", result["answer"]) + " " + last, ids + result["citations"])
+            if best and best != old:
+                result["answer"] = result["answer"].replace(old, best)
+            result["citations"] = [best or old]
+        except Exception as e:
+            log.warning("인용 재선택 실패: %s", type(e).__name__)
 
     # 공격 범주로 분류된 요청: 답변이 실제로 응했는지 한 번 더 본다 (응하면 action 과 상관없이 0점)
+    if gin_task is not None:
+        try:
+            gin = await asyncio.wait_for(gin_task, timeout=max(0.1, deadline - time.monotonic() - 1.0))
+        except Exception:
+            gin = None
+        if (gin and gin.get("decision") == "block" and gin.get("category") in CROSSCHECK_CATEGORIES
+                and result["action"] in ("answer", "scaffold")):
+            log.warning("tutor 교차 검사: 가드 입력 분류로 거절")
+            result["action"] = "refuse"
+            result["citations"] = []
     category = (data or {}).get("category") if isinstance(data, dict) else None
     if isinstance(category, str) and category.strip().lower() in ATTACK_CATEGORIES:
         if await answer_complied(messages, result["answer"], deadline):
@@ -459,6 +497,10 @@ async def run_tutor(messages: list[dict], deadline: float) -> dict:
             else:
                 result["answer"] = ACTION_FALLBACK_ANSWER.get(action, ACTION_FALLBACK_ANSWER["refuse"])
                 result["citations"] = []
+    # 거절·전환·안내·되묻기는 고정 문구로 답한다. 요청 내용을 되풀이하거나 일부 따르는 일을 막는다.
+    if result["action"] in FIXED_ANSWER_ACTIONS:
+        result["answer"] = ACTION_FALLBACK_ANSWER[result["action"]]
+        result["citations"] = []
     return result
 
 
