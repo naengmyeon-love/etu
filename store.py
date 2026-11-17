@@ -4,6 +4,9 @@
     store = VectorStore.load_or_build("kb", "index")   # 서버를 띄울 때 한 번
     hits = await store.search("꿈틀이 실습 힌트 주세요", top_n=10)
     # hits[i] = {"id": "PY-01-02", "title": ..., "text": ..., "score": ...}
+
+v2: search() 에 query_vec 을 넘기면 질문 임베딩을 다시 부르지 않는다.
+    서버가 질문 임베딩 하나를 KB 검색과 공개 세트 예시 검색에 같이 쓰기 위한 것이다.
 """
 from __future__ import annotations
 
@@ -21,10 +24,10 @@ from rank_bm25 import BM25Okapi
 from index import build_index, chunk_text_for_search, normalize
 
 TOKEN_RE = re.compile(r"[a-z0-9_]+|[가-힣]+")
-RRF_K = 60   # 순위 결합 상수. 클수록 상위 순위의 영향이 줄어든다
-KW_MIN_RATIO = 0.25    # BM25 점수가 최고점의 이 비율보다 낮으면 키워드 쪽 점수를 주지 않는다
-EMBED_TIMEOUT = 3.0    # 질문 임베딩 시도 한 번의 제한 시간(초)
-EMBED_BUDGET = 6.0     # 재시도까지 포함한 질문 임베딩 전체 제한 시간(초). 요청 제한 30초 안에 LLM 몫을 남긴다
+RRF_K = 60           # 순위 결합 상수. 클수록 상위 순위의 영향이 줄어든다
+KW_MIN_RATIO = 0.25  # BM25 점수가 최고점의 이 비율보다 낮으면 키워드 쪽 점수를 주지 않는다
+EMBED_TIMEOUT = 3.0  # 질문 임베딩 시도 한 번의 제한 시간(초)
+EMBED_BUDGET = 6.0   # 재시도까지 포함한 질문 임베딩 전체 제한 시간(초). 요청 제한 30초 안에 LLM 몫을 남긴다
 
 log = logging.getLogger(__name__)
 
@@ -55,8 +58,8 @@ class VectorStore:
         self._client = AsyncOpenAI(
             base_url=os.environ["EMBEDDING_BASE_URL"],
             api_key=os.environ["EMBEDDING_API_KEY"],
-            timeout=EMBED_TIMEOUT,   # 기본값은 10분이라 API가 멈추면 요청이 그대로 매달린다
-            max_retries=1,           # 일시적인 오류는 SDK가 한 번 다시 시도한다
+            timeout=EMBED_TIMEOUT,  # 기본값은 10분이라 API가 멈추면 요청이 그대로 매달린다
+            max_retries=1,          # 일시적인 오류는 SDK가 한 번 다시 시도한다
         )
         self._model = os.environ["EMBEDDING_MODEL"]
 
@@ -98,6 +101,7 @@ class VectorStore:
         top_n: int = 10,
         mode: str = "hybrid",
         min_vector_score: float | None = None,
+        query_vec: np.ndarray | None = None,
     ) -> list[dict]:
         """관련 chunk를 점수 순으로 top_n개 돌려준다.
 
@@ -106,11 +110,9 @@ class VectorStore:
         질문 임베딩이 실패하면 hybrid는 키워드 검색만으로 답한다.
         키워드 검색만 쓸 때는 단어가 의미 있게 겹친 chunk만 돌려준다 (없으면 빈 목록).
         빈 질문은 API를 부르지 않고 빈 목록을 돌려준다.
+        query_vec 을 주면 임베딩 API를 부르지 않고 그 벡터를 쓴다.
 
         min_vector_score: 코사인 유사도가 이 값보다 낮은 chunk는 버린다.
-        결과가 빈 목록이면 KB에 없는 질문으로 보고 거절하면 된다.
-        적당한 값은 임베딩 모델마다 다르니 `--top 5`로 vector_score를 찍어 보고 정한다.
-        임베딩이 실패해 키워드 검색만 쓴 경우에는 적용되지 않는다.
         """
         if not query.strip():
             return []
@@ -119,7 +121,8 @@ class VectorStore:
         vec = kw = None
         if mode in ("hybrid", "vector"):
             try:
-                vec = self.vector_scores(await self.embed_query(query))
+                qv = query_vec if query_vec is not None else await self.embed_query(query)
+                vec = self.vector_scores(qv)
             except Exception as e:
                 if mode == "vector":
                     raise
@@ -150,8 +153,6 @@ class VectorStore:
         for i in np.argsort(-final)[:top_n]:
             if not np.isfinite(final[i]):
                 continue
-            # score(RRF)는 순위로만 만든 값이라 관련 없는 질문에도 1등은 늘 비슷한 점수를 받는다.
-            # "KB에 없는 질문"은 코사인 유사도로 걸러야 한다.
             if min_vector_score is not None and vec is not None and vec[i] < min_vector_score:
                 continue
             hit = dict(self.chunks[i])
@@ -174,7 +175,6 @@ def section_ids(hits: list[dict]) -> list[str]:
 
 if __name__ == "__main__":
     import argparse
-    import asyncio
 
     ap = argparse.ArgumentParser(description="검색 확인용")
     ap.add_argument("query")
@@ -192,7 +192,7 @@ if __name__ == "__main__":
             print("관련 chunk 없음 (KB 밖 질문으로 판단)")
         for h in hits:
             preview = h["text"][:70].replace("\n", " ")
-            cos = f"cos {h['vector_score']:.3f}" if "vector_score" in h else "cos   -  "
-            print(f"{h['score']:.4f}  {cos}  {h['id']:<10}  {h['title'][:30]}  |  {preview}")
+            cos = f"cos {h['vector_score']:.3f}" if "vector_score" in h else "cos -  "
+            print(f"{h['score']:.4f} {cos} {h['id']:<10} {h['title'][:30]} | {preview}")
 
     asyncio.run(main())
