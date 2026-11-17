@@ -1,4 +1,4 @@
-"""/tutor, /guard 서버 (v3).
+"""/tutor, /guard 서버 (v3.2).
 
 실행 (.env 를 읽어 들인 터미널에서):
     export SERVER_TOKEN=my-token          # submission.json 의 token 과 같은 값
@@ -534,11 +534,18 @@ async def run_tutor(messages: list[dict], deadline: float) -> dict:
         cite = f" ({result['citations'][0]})" if result["citations"] else ""
         result["answer"] = SCAFFOLD_GENERIC + cite
 
+    # v3.2: 정서적 어려움과 수업 질문이 섞인 입력에서 수업 질문에만 답하는 경우를 막는다
+    if gcat == "emotional_distress" and result["action"] != "escalate" and category not in ATTACK_CATEGORIES:
+        log.warning("tutor 교차 검사: 정서적 어려움으로 보고 escalate")
+        result["action"] = "escalate"
+        result["citations"] = []
+
     # 공격 의심(튜터 자체 범주 또는 가드 범주): 답변이 실제로 응했는지 한 번 더 본다 (응하면 action 과 상관없이 0점)
     own_attack = category in ATTACK_CATEGORIES
     suspect = category if own_attack else (gcat if gcat in ATTACK_CATEGORIES else "")
     if suspect and (own_attack or result["action"] in ("answer", "scaffold")):
-        if await answer_complied(messages, result["answer"], deadline, from_guard=not own_attack):
+        check = await answer_complied(messages, result["answer"], deadline, from_guard=not own_attack)
+        if check is True or (check is None and own_attack):
             log.warning("tutor 자체 검수: 응한 답변을 대체 응답으로 바꿈")
             if not own_attack:
                 result["action"] = ATTACK_ACTION.get(suspect, "refuse")
@@ -567,19 +574,21 @@ async def run_tutor(messages: list[dict], deadline: float) -> dict:
     return result
 
 
-async def answer_complied(messages: list[dict], answer: str, deadline: float, from_guard: bool = False) -> bool:
+async def answer_complied(messages: list[dict], answer: str, deadline: float, from_guard: bool = False) -> bool | None:
     """자체 검수. 시간이 없거나 판정에 실패하면 응하지 않은 것으로 본다.
 
     from_guard: 튜터는 정상으로 봤고 가드 분류만 공격으로 본 경우. 요청이 정말 부적절한지도 함께 판정한다.
     """
     if deadline - time.monotonic() < CHECK_MIN_LEFT:
-        return False
+        return None
     user = f"<대화>\n{render_dialogue(messages)}\n</대화>\n\n<답변>\n{answer}\n</답변>"
     if from_guard:
         data = await app.state.llm.ask_json(CHECK_GUARD_SYSTEM, user, deadline, effort=GUARD_CHECK_REASONING_EFFORT)
-        return bool(data and data.get("inappropriate") is True and data.get("complied") is True)
+        if not data or not isinstance(data.get("inappropriate"), bool) or not isinstance(data.get("complied"), bool):
+            return None
+        return data["inappropriate"] and data["complied"]
     data = await app.state.llm.ask_json(CHECK_SYSTEM, user, deadline, effort=CHECK_REASONING_EFFORT)
-    return bool(data and data.get("complied") is True)
+    return data["complied"] if data and isinstance(data.get("complied"), bool) else None
 
 
 async def material_missing(messages: list[dict], evidence: str, answer: str, deadline: float) -> str | None:
