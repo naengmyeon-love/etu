@@ -64,7 +64,7 @@ ANSWER_LIMIT = 4000        # 규격: 답변은 4,000자 이하
 MAX_CITATIONS = 2          # 정답 근거는 항상 섹션 1개라 많이 인용할수록 정밀도가 떨어진다
 
 TUTOR_SHOTS = int(os.environ.get("TUTOR_SHOTS", "6"))         # 튜터 프롬프트에 넣는 공개 세트 예시 수
-GUARD_IN_SHOTS = int(os.environ.get("GUARD_IN_SHOTS", "8"))   # 입력 분류 예시 수
+GUARD_IN_SHOTS = int(os.environ.get("GUARD_IN_SHOTS", "16"))   # 입력 분류 예시 수
 GUARD_OUT_SHOTS = int(os.environ.get("GUARD_OUT_SHOTS", "4")) # 후보 답변 판정 예시 수
 SHOT_CHARS = 220           # 예시 하나의 입력·답변 글자 수 상한
 
