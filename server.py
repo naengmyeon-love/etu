@@ -1,4 +1,4 @@
-"""/tutor, /guard 서버 (v3.3).
+"""/tutor, /guard 서버 (v3.4).
 
 실행 (.env 를 읽어 들인 터미널에서):
     export SERVER_TOKEN=my-token          # submission.json 의 token 과 같은 값
@@ -68,6 +68,8 @@ TUTOR_SHOTS = int(os.environ.get("TUTOR_SHOTS", "6"))         # 튜터 프롬프
 GUARD_IN_SHOTS = int(os.environ.get("GUARD_IN_SHOTS", "16"))   # 입력 분류 예시 수
 GUARD_OUT_SHOTS = int(os.environ.get("GUARD_OUT_SHOTS", "4")) # 후보 답변 판정 예시 수
 SHOT_CHARS = 220           # 예시 하나의 입력·답변 글자 수 상한
+# v3.4: 튜터 예시에 모범 답변 문장을 넣을지. 넣으면 비슷한 다른 문항의 사실을 섞어 쓰는 일이 늘어난다 (홀드아웃 측정)
+TUTOR_SHOT_REF = os.environ.get("TUTOR_SHOT_REF", "0") == "1"
 
 ACTIONS = ("answer", "scaffold", "clarify", "abstain", "redirect", "refuse", "escalate")
 CATEGORIES = (
@@ -249,7 +251,7 @@ GUARD_CHECK_REASONING_EFFORT = os.environ.get("GUARD_CHECK_REASONING_EFFORT", "l
 ATTACK_CATEGORIES = {"jailbreak_injection", "harmful_content", "off_topic", "academic_dishonesty"}
 CHECK_MIN_LEFT = 6.0  # 남은 시간이 이보다 적으면 자체 검수를 건너뛴다
 # 가드가 공격으로 본 입력의 대체 응답 조건. both: 검수기가 부적절+응함 모두 true (v3.2), inappropriate: 부적절만 true (실험: 과잉 거절이 늘어 기본값 아님)
-GUARD_SUSPECT_MODE = os.environ.get("GUARD_SUSPECT_MODE", "both")  # both(v3.2 그대로) | inappropriate
+GUARD_SUSPECT_MODE = os.environ.get("GUARD_SUSPECT_MODE", "harmful")  # harmful(v3.4: 가드가 harmful_content 로 본 입력만 부적절이면 대체) | both(v3.2) | inappropriate
 # v3.3: 제출용 답안 요구(academic_dishonesty)는 항상 고정 힌트 문구로 답한다 (답안 일부라도 써 주면 0점)
 ACADEMIC_FIXED = os.environ.get("ACADEMIC_FIXED", "1") == "1"
 # v3.3: 혐오·차별·배제 발언을 수업으로 돌릴 때는 그 표현을 쓰지 말라고 분명히 말한다 (일반 전환 문구는 동조로 보일 수 있음)
@@ -331,7 +333,8 @@ def render_tutor_shots(shots: list[dict]) -> str:
         return "(없음)"
     lines = []
     for e in shots:
-        lines.append(f'- 학습자: "{_short(e["last"])}"\n  → category={e["category"]}, action={e["action"]}\n  답변 예: "{_short(e["reference"])}"')
+        lines.append(f'- 학습자: "{_short(e["last"])}"\n  → category={e["category"]}, action={e["action"]}'
+                     + (f'\n  답변 예: "{_short(e["reference"])}"' if TUTOR_SHOT_REF else ''))
     return "\n".join(lines)
 
 
@@ -553,7 +556,7 @@ async def run_tutor(messages: list[dict], deadline: float) -> dict:
     own_attack = category in ATTACK_CATEGORIES
     suspect = category if own_attack else (gcat if gcat in ATTACK_CATEGORIES else "")
     if suspect and (own_attack or result["action"] in ("answer", "scaffold")):
-        check = await answer_complied(messages, result["answer"], deadline, from_guard=not own_attack)
+        check = await answer_complied(messages, result["answer"], deadline, from_guard=not own_attack, suspect=suspect)
         if check is True or (check is None and own_attack):
             log.warning("tutor 자체 검수: 응한 답변을 대체 응답으로 바꿈")
             if not own_attack:
@@ -587,7 +590,7 @@ async def run_tutor(messages: list[dict], deadline: float) -> dict:
     return result
 
 
-async def answer_complied(messages: list[dict], answer: str, deadline: float, from_guard: bool = False) -> bool | None:
+async def answer_complied(messages: list[dict], answer: str, deadline: float, from_guard: bool = False, suspect: str = "") -> bool | None:
     """자체 검수. 시간이 없거나 판정에 실패하면 응하지 않은 것으로 본다.
 
     from_guard: 튜터는 정상으로 봤고 가드 분류만 공격으로 본 경우. 요청이 정말 부적절한지도 함께 판정한다.
@@ -599,7 +602,7 @@ async def answer_complied(messages: list[dict], answer: str, deadline: float, fr
         data = await app.state.llm.ask_json(CHECK_GUARD_SYSTEM, user, deadline, effort=GUARD_CHECK_REASONING_EFFORT)
         if not data or not isinstance(data.get("inappropriate"), bool) or not isinstance(data.get("complied"), bool):
             return None
-        return data["inappropriate"] and (data["complied"] or GUARD_SUSPECT_MODE == "inappropriate")
+        return data["inappropriate"] and (data["complied"] or GUARD_SUSPECT_MODE == "inappropriate" or (GUARD_SUSPECT_MODE == "harmful" and suspect == "harmful_content"))
     data = await app.state.llm.ask_json(CHECK_SYSTEM, user, deadline, effort=CHECK_REASONING_EFFORT)
     return data["complied"] if data and isinstance(data.get("complied"), bool) else None
 
