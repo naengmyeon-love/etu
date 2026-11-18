@@ -286,10 +286,32 @@ def parse_messages(body) -> list[dict]:
     return out
 
 
-def search_query(messages: list[dict]) -> str:
-    """키워드 검색 질문. 마지막 학습자 발화를 앞에 두고, 바로 앞 학습자 발화 두 개를 덧붙인다."""
-    users = [m["content"].strip() for m in messages if m["role"] == "user" and m["content"].strip()]
-    return "\n".join(reversed(users[-3:]))[:QUERY_CHARS]
+def search_query(
+    messages: list[dict],
+    include_history: bool = False,
+) -> str:
+    """검색용 질문을 만든다.
+
+    include_history=False:
+        마지막 학습자 질문만 사용한다.
+
+    include_history=True:
+        맥락이 필요한 질문이므로 최근 학습자 질문 3개까지 함께 사용한다.
+    """
+
+    users = [
+        m["content"].strip()
+        for m in messages
+        if m["role"] == "user" and m["content"].strip()
+    ]
+
+    if not users:
+        return ""
+
+    if include_history:
+        return "\n".join(reversed(users[-3:]))[:QUERY_CHARS]
+
+    return users[-1][:QUERY_CHARS]
 
 
 def last_user(messages: list[dict]) -> str:
@@ -298,6 +320,300 @@ def last_user(messages: list[dict]) -> str:
             return m["content"]
     return ""
 
+def retrieval_profile(messages: list[dict]) -> dict:
+    """질문을 하나의 난이도로 분류하지 않고,
+    검색에 필요한 특징을 각각 분석한다.
+    """
+
+    q = last_user(messages).strip().lower()
+
+    # ---------------------------------------------------------
+    # 1. answer_complexity
+    # 답변 자체가 얼마나 많은 설명/추론을 요구하는가?
+    # ---------------------------------------------------------
+
+    high_complexity_words = (
+        "비교", "차이", "공통점", "장단점", "분석",
+        "근거", "비교해서", "정리하고",
+        "설명하고", "이유까지"
+    )
+
+    medium_complexity_words = (
+        "설명", "왜", "어떻게", "원리", "과정", "이유"
+    )
+
+    if any(word in q for word in high_complexity_words):
+        answer_complexity = "high"
+
+    elif any(word in q for word in medium_complexity_words):
+        answer_complexity = "medium"
+
+    else:
+        answer_complexity = "low"
+
+
+    # ---------------------------------------------------------
+    # 2. context_dependency
+    # 이전 대화를 알아야 현재 질문을 이해할 수 있는가?
+    # ---------------------------------------------------------
+
+    context_words = (
+        "아까", "방금", "위에서", "앞에서", "전에",
+        "그거", "그것", "이거", "이것", "저거",
+        "첫 번째", "두 번째", "세 번째",
+        "앞의", "이전"
+    )
+
+    context_dependency = any(
+        word in q for word in context_words
+    )
+
+
+    # ---------------------------------------------------------
+    # 3. multi_intent
+    # 한 질문 안에 여러 요구가 동시에 들어 있는가?
+    # ---------------------------------------------------------
+
+    multi_words = (
+        "그리고", "또", "동시에", "각각",
+        "둘 다", "공통점과", "차이와",
+        "비교해서", "설명하고", "정리하고"
+    )
+
+    multi_intent = (
+        any(word in q for word in multi_words)
+        or q.count("?") >= 2
+    )
+
+
+    # ---------------------------------------------------------
+    # 4. keyword_specificity
+    # 정확한 코드명/숫자/영문 식별자 등이 중요한 질문인가?
+    # ---------------------------------------------------------
+
+    has_identifier = bool(
+        re.search(r"[A-Za-z_][A-Za-z0-9_]*", q)
+    )
+
+    has_number = bool(
+        re.search(r"\d", q)
+    )
+
+    keyword_specificity = (
+        has_identifier
+        or has_number
+    )
+
+
+        # ---------------------------------------------------------
+    # 4개 특징을 이용해 검색 범위를 결정한다.
+    #
+    # V2처럼 기본 검색량을 너무 많이 줄이지 않고,
+    # baseline 수준을 기본으로 유지한다.
+    # ---------------------------------------------------------
+
+    top_n = 10
+    max_sections = 4
+
+    # 단순하고 독립적이며 정확한 키워드가 있는 질문만
+    # 검색량을 약간 줄인다.
+    if (
+        answer_complexity == "low"
+        and not context_dependency
+        and not multi_intent
+        and keyword_specificity
+    ):
+        top_n = 8
+        max_sections = 3
+
+    # 복잡한 답변은 더 많은 근거 확보
+    if answer_complexity == "high":
+        top_n = max(top_n, 13)
+        max_sections = 5
+
+    # 이전 대화에 의존하면 후보를 더 넓게 탐색
+    if context_dependency:
+        top_n += 2
+
+    # 여러 의도가 섞이면 Query Decomposition과 함께
+    # 검색 범위도 확대
+    if multi_intent:
+        top_n += 3
+        max_sections = 5
+
+    # 지나친 검색량 방지
+    top_n = min(max(top_n, 8), 16)
+    max_sections = min(max(max_sections, 3), 5)
+
+    return {
+        "answer_complexity": answer_complexity,
+        "context_dependency": context_dependency,
+        "multi_intent": multi_intent,
+        "keyword_specificity": keyword_specificity,
+        "top_n": top_n,
+        "max_sections": max_sections,
+    }
+
+async def build_search_queries(
+    messages: list[dict],
+    profile: dict,
+    deadline: float,
+) -> list[str]:
+    """질문의 의미를 보고 검색 query를 만든다.
+
+    단순하고 독립적인 질문:
+        원래 질문 그대로 검색한다.
+
+    multi_intent / context_dependency 질문:
+        기존 LLM을 Query Planner로 한 번 사용해서
+        독립적으로 이해 가능한 검색 질문 1~3개로 재구성한다.
+
+    Planner가 실패하거나 시간이 부족하면:
+        원래 검색 query로 fallback한다.
+    """
+
+    base = search_query(
+        messages,
+        include_history=profile["context_dependency"],
+    )
+
+    if not base:
+        return []
+
+    # 단순한 질문은 추가 LLM 호출 없이 그대로 검색
+    needs_planning = (
+        profile["multi_intent"]
+        or profile["context_dependency"]
+    )
+
+    if not needs_planning:
+        return [base]
+
+    # 남은 시간이 부족하면 Planner를 호출하지 않는다.
+    if deadline - time.monotonic() < 4.0:
+        return [base]
+
+    # 최근 대화만 Planner에게 전달
+    recent_messages = messages[-6:]
+
+    dialogue_lines = []
+
+    for m in recent_messages:
+        role = (
+            "학습자"
+            if m["role"] == "user"
+            else "튜터"
+        )
+
+        content = m["content"].strip()
+
+        dialogue_lines.append(
+            f"{role}: {content[:600]}"
+        )
+
+    dialogue = "\n".join(dialogue_lines)
+
+    planner_system = """
+너는 교육용 RAG 시스템의 검색 질의 플래너다.
+
+사용자의 질문에 직접 답하지 말고,
+자료 검색에 사용할 query만 만든다.
+
+규칙:
+
+1. 질문의 의미를 이해해서 검색 query를 만든다.
+2. 단순히 '그리고', '설명하고' 같은 단어 위치에서 문장을 자르지 않는다.
+3. 각 query는 혼자 읽어도 무엇을 검색해야 하는지 이해할 수 있어야 한다.
+4. '그것', '아까', '두 번째' 같은 표현은 최근 대화를 참고하여
+   가능한 경우 구체적인 대상으로 바꾼다.
+5. 여러 요구가 있으면 의미 단위로 나눈다.
+6. 서로 중복되는 query는 만들지 않는다.
+7. 원래 질문에 없는 새로운 사실이나 주제를 추가하지 않는다.
+8. 코드명, 숫자, 전문용어, 고유명사는 가능한 한 그대로 유지한다.
+9. 최대 3개의 query만 만든다.
+10. 반드시 JSON 객체로만 답한다.
+
+형식:
+{
+  "queries": [
+    "검색 질문 1",
+    "검색 질문 2"
+  ]
+}
+""".strip()
+
+    planner_user = (
+        f"<최근대화>\n{dialogue}\n</최근대화>\n\n"
+        f"<현재질문>\n{last_user(messages)}\n</현재질문>"
+    )
+
+    try:
+        # Query Planner가 전체 요청 시간을 너무 많이 먹지 않도록
+        # 최대 약 4초만 허용한다.
+        planner_deadline = min(
+            deadline,
+            time.monotonic() + 4.0,
+        )
+
+        data = await app.state.llm.ask_json(
+            planner_system,
+            planner_user,
+            planner_deadline,
+            effort="low",
+        )
+
+    except Exception as e:
+        log.warning(
+            "Query Planner 실패: %s",
+            type(e).__name__,
+        )
+
+        return [base]
+
+    raw_queries = (
+        data.get("queries")
+        if isinstance(data, dict)
+        else None
+    )
+
+    if not isinstance(raw_queries, list):
+        return [base]
+
+    planned_queries: list[str] = []
+
+    for item in raw_queries:
+        if not isinstance(item, str):
+            continue
+
+        q = item.strip()
+
+        if len(q) < 4:
+            continue
+
+        q = q[:QUERY_CHARS]
+
+        if q not in planned_queries:
+            planned_queries.append(q)
+
+        if len(planned_queries) >= 3:
+            break
+
+    if not planned_queries:
+        return [base]
+
+    # 원문 검색을 완전히 버리지 않는다.
+    # Planner가 잘못 분해했을 때의 안전장치다.
+    final_queries = [base]
+
+    for q in planned_queries:
+        if q not in final_queries:
+            final_queries.append(q)
+
+        # 원문 포함 최대 3개
+        if len(final_queries) >= 3:
+            break
+
+    return final_queries
 
 def render_dialogue(messages: list[dict]) -> str:
     """대화를 데이터로 표시해 넘긴다. 길면 최근 것만 남긴다."""
@@ -385,24 +701,369 @@ class Evidence:
             ids.append(sid)
         return "\n\n".join(blocks), ids
 
-    async def find(self, query: str, query_vec: np.ndarray | None = None,
-                   first_ids: list[str] | None = None) -> tuple[str, list[str]]:
-        """(LLM 에 넘길 자료 문자열, 그 안에 든 섹션 id 목록)을 돌려준다.
+    async def find(
+        self,
+        query: str,
+        query_vec: np.ndarray | None = None,
+        query_vecs: list[np.ndarray | None] | None = None,
+        first_ids: list[str] | None = None,
+        top_n: int = TOP_N,
+        max_sections: int = MAX_SECTIONS,
+        rerank_sections: bool = False,
+        keyword_specificity: bool = False,
+        queries: list[str] | None = None,
+        dynamic_topk: bool = True,
+        retry_if_ambiguous: bool = True,
+    ) -> tuple[str, list[str]]:
+        """여러 검색 query를 합쳐 adaptive retrieval을 수행한다."""
 
-        first_ids: 검색과 상관없이 먼저 넣을 섹션 (후보 답변이 인용한 섹션 등). 통째로 넣는다.
-        """
+        search_queries = [
+            q.strip()
+            for q in (queries or [query])
+            if q and q.strip()
+        ]
+
+        if not search_queries:
+            if query.strip():
+                search_queries = [query.strip()]
+            else:
+                return "", []
+
         by_section: dict[str, list[dict]] = {}
+
+        # Guard 등에서 특정 citation을 먼저 넣어야 할 때 사용
         for sid in first_ids or []:
             if sid in self.sections:
                 by_section.setdefault(sid, [])
-        if query.strip():
-            hits = await self.store.search(query, top_n=TOP_N, query_vec=query_vec)
-            for h in hits:
-                by_section.setdefault(h["id"], []).append(h)
+
+        # -------------------------------------------------
+        # 각 query에 대응하는 embedding 준비
+        # -------------------------------------------------
+
+        effective_vecs = list(query_vecs or [])
+
+        while len(effective_vecs) < len(search_queries):
+            effective_vecs.append(query_vec)
+
+        # -------------------------------------------------
+        # 각 query를 별도로 Hybrid Search
+        # -------------------------------------------------
+
+        tasks = [
+            self.store.search(
+                q,
+                top_n=top_n,
+                query_vec=effective_vecs[i],
+            )
+            for i, q in enumerate(search_queries)
+        ]
+
+        results = await asyncio.gather(
+            *tasks,
+            return_exceptions=True,
+        )
+
+        merged_hits: list[dict] = []
+
+        for query_idx, result in enumerate(results):
+            if isinstance(result, Exception):
+                continue
+
+            for hit in result:
+                item = dict(hit)
+
+                # 어떤 sub-query에서 나온 결과인지 기록
+                item["_query_idx"] = query_idx
+
+                merged_hits.append(item)
+
+        # -------------------------------------------------
+        # 1차 Retrieval Confidence
+        # -------------------------------------------------
+
+        preliminary: dict[str, float] = {}
+
+        for hit in merged_hits:
+            sid = hit["id"]
+
+            score = float(
+                hit.get("score", 0.0)
+            )
+
+            if sid not in preliminary:
+                preliminary[sid] = score
+            else:
+                preliminary[sid] = max(
+                    preliminary[sid],
+                    score,
+                )
+
+        prelim_ranked = sorted(
+            preliminary.values(),
+            reverse=True,
+        )
+
+        if len(prelim_ranked) >= 2:
+            first_score = prelim_ranked[0]
+            second_score = prelim_ranked[1]
+
+            relative_gap = (
+                (first_score - second_score)
+                / max(abs(first_score), 1e-9)
+            )
+
+        elif len(prelim_ranked) == 1:
+            relative_gap = 1.0
+
+        else:
+            relative_gap = 0.0
+
+        low_confidence = (
+            relative_gap < 0.08
+        )
+
+        # -------------------------------------------------
+        # 검색 결과가 애매하면 한 번만 검색 범위 확대
+        #
+        # 여러 sub-query를 이미 사용한 경우에는
+        # 검색량이 충분하므로 추가 retry는 하지 않는다.
+        # -------------------------------------------------
+
+        if (
+            retry_if_ambiguous
+            and len(search_queries) == 1
+            and top_n < 18
+            and (
+                low_confidence
+                or len(preliminary)
+                < min(3, max_sections)
+            )
+        ):
+            try:
+                expanded_top_n = min(
+                    18,
+                    top_n + 6,
+                )
+
+                extra_hits = await self.store.search(
+                    search_queries[0],
+                    top_n=expanded_top_n,
+                    query_vec=effective_vecs[0],
+                )
+
+                for hit in extra_hits:
+                    item = dict(hit)
+                    item["_query_idx"] = 0
+                    merged_hits.append(item)
+
+            except Exception as e:
+                log.warning(
+                    "확장 검색 실패: %s",
+                    type(e).__name__,
+                )
+
+        # -------------------------------------------------
+        # 검색 결과를 section별로 합친다.
+        # -------------------------------------------------
+
+        for hit in merged_hits:
+            by_section.setdefault(
+                hit["id"],
+                [],
+            ).append(hit)
+
         if not by_section:
             return "", []
-        return self.render(by_section)
 
+        if not rerank_sections:
+            return self.render(
+                by_section,
+                max_sections=max_sections,
+            )
+
+        # -------------------------------------------------
+        # Section Reranking
+        # -------------------------------------------------
+
+        max_keyword_score = max(
+            (
+                float(
+                    h.get("keyword_score")
+                    or 0.0
+                )
+                for h in merged_hits
+            ),
+            default=0.0,
+        )
+
+        section_scores: dict[str, float] = {}
+
+        for sid, section_hits in by_section.items():
+            if not section_hits:
+                continue
+
+            # 동일 section이 같은 query에서 여러 번 나와도
+            # query별 최고 점수만 사용한다.
+            per_query_best: dict[int, float] = {}
+
+            for hit in section_hits:
+                query_idx = int(
+                    hit.get("_query_idx", 0)
+                )
+
+                score = float(
+                    hit.get("score", 0.0)
+                )
+
+                old = per_query_best.get(
+                    query_idx,
+                    float("-inf"),
+                )
+
+                if score > old:
+                    per_query_best[
+                        query_idx
+                    ] = score
+
+            scores = sorted(
+                per_query_best.values(),
+                reverse=True,
+            )
+
+            if not scores:
+                continue
+
+            # 가장 강한 검색 근거를 중심으로 section 점수 계산
+            section_score = scores[0]
+
+            if len(scores) >= 2:
+                section_score += (
+                    scores[1] * 0.6
+                )
+
+            if len(scores) >= 3:
+                section_score += (
+                    scores[2] * 0.3
+                )
+
+            # 여러 sub-query에서 반복적으로 등장한 section은
+            # 여러 의도를 함께 설명할 가능성이 있으므로 보너스
+            query_coverage = len(
+                per_query_best
+            )
+
+            if query_coverage >= 2:
+                section_score += (
+                    min(
+                        query_coverage - 1,
+                        2,
+                    )
+                    * 0.004
+                )
+
+            # 정확한 키워드가 중요한 질문에만
+            # BM25 신호를 작은 보너스로 사용
+            if (
+                keyword_specificity
+                and max_keyword_score > 0
+            ):
+                best_keyword_score = max(
+                    float(
+                        h.get("keyword_score")
+                        or 0.0
+                    )
+                    for h in section_hits
+                )
+
+                keyword_ratio = (
+                    best_keyword_score
+                    / max_keyword_score
+                )
+
+                section_score += (
+                    0.004
+                    * keyword_ratio
+                )
+
+            section_scores[
+                sid
+            ] = section_score
+
+        # -------------------------------------------------
+        # first_ids는 앞쪽에 고정
+        # -------------------------------------------------
+
+        pinned = [
+            sid
+            for sid in (first_ids or [])
+            if sid in by_section
+        ]
+
+        ranked = sorted(
+            section_scores,
+            key=section_scores.get,
+            reverse=True,
+        )
+
+        ordered_ids = (
+            pinned
+            + [
+                sid
+                for sid in ranked
+                if sid not in pinned
+            ]
+        )
+
+        by_section = {
+            sid: by_section[sid]
+            for sid in ordered_ids
+        }
+
+        # -------------------------------------------------
+        # Retrieval Confidence → Dynamic Top-K
+        # -------------------------------------------------
+
+        ranked_scores = [
+            section_scores[sid]
+            for sid in ranked
+            if sid in section_scores
+        ]
+
+        final_sections = max_sections
+
+        # multi-intent 질문은 여러 근거가 필요하므로
+        # section을 함부로 줄이지 않는다.
+        if (
+            dynamic_topk
+            and len(search_queries) == 1
+            and len(ranked_scores) >= 2
+        ):
+            best = ranked_scores[0]
+            second = ranked_scores[1]
+
+            gap = (
+                (best - second)
+                / max(abs(best), 1e-9)
+            )
+
+            # 1위가 확실하면 context를 조금 줄임
+            if gap >= 0.25:
+                final_sections = max(
+                    2,
+                    max_sections - 1,
+                )
+
+            # 후보가 비슷하면 더 많은 근거 유지
+            elif gap <= 0.08:
+                final_sections = min(
+                    5,
+                    max_sections + 1,
+                )
+
+        return self.render(
+            by_section,
+            max_sections=final_sections,
+        )   
 
 # ---------------------------------------------------------------- LLM 호출
 
@@ -488,15 +1149,67 @@ async def run_tutor(messages: list[dict], deadline: float) -> dict:
     last = last_user(messages)
     if looks_low_signal(last):  # "ㅁㄴㅇㄹ", "??", "ㅋㅋㅋ": 라벨은 항상 clarify
         return {"answer": ACTION_FALLBACK_ANSWER["clarify"], "action": "clarify", "citations": []}
+        
     ctx = context_text(messages)
-    qvec = await embed_or_none(ctx)
+
+    profile = retrieval_profile(messages)
+
+    search_queries = await build_search_queries(
+        messages,
+        profile,
+        deadline,
+    )
+
+    primary_query = (
+        search_queries[0]
+        if search_queries
+        else last
+    )
+
+    qvec = await embed_or_none(
+        primary_query
+    )
+
+    # Query Decomposition으로 여러 검색 질문이 생긴 경우,
+    # 각 query마다 별도의 embedding을 만든다.
+    query_vecs = [qvec]
+
+    if len(search_queries) > 1:
+        extra_vecs = await asyncio.gather(
+            *[
+                embed_or_none(q)
+                for q in search_queries[1:]
+            ]
+        )
+
+        query_vecs.extend(extra_vecs)
     try:
-        evidence, ids = await app.state.evidence.find(search_query(messages), query_vec=qvec)
+        evidence, ids = await app.state.evidence.find(
+            primary_query,
+            query_vec=qvec,
+            query_vecs=query_vecs,
+            top_n=profile["top_n"],
+            max_sections=profile["max_sections"],
+            rerank_sections=True,
+            keyword_specificity=profile["keyword_specificity"],
+            queries=search_queries,
+            dynamic_topk=True,
+            retry_if_ambiguous=True,
+        )
     except Exception as e:  # 검색이 실패해도 응대 방식은 정해야 한다
         log.warning("검색 실패: %s", type(e).__name__)
         evidence, ids = "", []
-    shots = app.state.examples.nearest(qvec, TUTOR_SHOTS, exclude_last=last, kind="tutor") if qvec is not None else []
 
+    shots = (
+        app.state.examples.nearest(
+            qvec,
+            TUTOR_SHOTS,
+            exclude_last=last,
+            kind="tutor",
+        )
+        if qvec is not None
+        else []
+    )
     user = (
         f"<자료>\n{evidence or '(찾은 자료 없음)'}\n</자료>\n\n"
         f"<예시>\n{render_tutor_shots(shots)}\n</예시>\n\n"
@@ -506,16 +1219,64 @@ async def run_tutor(messages: list[dict], deadline: float) -> dict:
     gin_task = asyncio.create_task(guard_input(messages, deadline, qvec)) if TUTOR_CROSSCHECK else None
     data = await app.state.llm.ask_json(TUTOR_SYSTEM, user, deadline, effort=REASONING_EFFORT)
     result = clean_tutor(data, ids)
-    if result["action"] in ("answer", "scaffold") and result["citations"]:
-        try:  # 답변 내용이 실제로 든 섹션 1개를 인용한다 (정답 근거는 항상 1개)
-            old = result["citations"][0]
-            best = app.state.evidence.pick_citation(SECTION_ID_RE.sub(" ", result["answer"]) + " " + last, ids + result["citations"])
-            if best and best != old:
-                result["answer"] = result["answer"].replace(old, best)
-            result["citations"] = [best or old]
-        except Exception as e:
-            log.warning("인용 재선택 실패: %s", type(e).__name__)
+    if (
+        result["action"] in ("answer", "scaffold")
+        and ids
+    ):
+        try:
+            citation_candidates = list(
+                dict.fromkeys(
+                    ids
+                    + result.get(
+                        "citations",
+                        [],
+                    )
+                )
+            )
 
+            citation_query = (
+                SECTION_ID_RE.sub(
+                    " ",
+                    result["answer"],
+                )
+                + " "
+                + primary_query
+            )
+
+            best = (
+                app.state.evidence.pick_citation(
+                    citation_query,
+                    citation_candidates,
+                )
+            )
+
+            old = (
+                result["citations"][0]
+                if result.get("citations")
+                else None
+            )
+
+            if best:
+                if (
+                    old
+                    and best != old
+                ):
+                    result["answer"] = (
+                        result["answer"].replace(
+                            old,
+                            best,
+                        )
+                    )
+
+                result["citations"] = [
+                    best
+                ]
+
+        except Exception as e:
+            log.warning(
+                "인용 재선택 실패: %s",
+                type(e).__name__,
+            )
     # 가드 입력 분류(동시에 돌린 것)를 받아 튜터 판단과 교차 확인한다
     gin = None
     if gin_task is not None:
