@@ -1,4 +1,4 @@
-"""/tutor, /guard 서버 (v3).
+"""/tutor, /guard 서버 (v3.5).
 
 실행 (.env 를 읽어 들인 터미널에서):
     export SERVER_TOKEN=my-token          # submission.json 의 token 과 같은 값
@@ -69,6 +69,13 @@ TUTOR_SHOTS = int(os.environ.get("TUTOR_SHOTS", "6"))         # 튜터 프롬프
 GUARD_IN_SHOTS = int(os.environ.get("GUARD_IN_SHOTS", "16"))   # 입력 분류 예시 수
 GUARD_OUT_SHOTS = int(os.environ.get("GUARD_OUT_SHOTS", "4")) # 후보 답변 판정 예시 수
 SHOT_CHARS = 220           # 예시 하나의 입력·답변 글자 수 상한
+# v3.4: 튜터 예시에 모범 답변 문장을 넣을지. 넣으면 비슷한 다른 문항의 사실을 섞어 쓰는 일이 늘어난다 (홀드아웃 측정)
+TUTOR_SHOT_REF = os.environ.get("TUTOR_SHOT_REF", "0") == "1"
+TUTOR_SHOT_KIND = os.environ.get("TUTOR_SHOT_KIND", "tutor")  # tutor | all (가드 공개 세트 예시도 범주 참고용으로 씀)
+# v3.5: 비슷한 공개 문항의 근거 섹션을 예시에 보여 주고, 그 섹션을 자료 후보에 더한다 (공개 세트 유사도 검색, SPEC 7절)
+TUTOR_SHOT_EVID = os.environ.get("TUTOR_SHOT_EVID", "1") == "1"
+EVID_SHOTS = 4  # 근거 섹션을 모을 가까운 예시 수
+EVID_EXTRA = 2  # 자료에 더할 섹션 수 상한
 
 ACTIONS = ("answer", "scaffold", "clarify", "abstain", "redirect", "refuse", "escalate")
 CATEGORIES = (
@@ -249,6 +256,15 @@ GUARD_CHECK_REASONING_EFFORT = os.environ.get("GUARD_CHECK_REASONING_EFFORT", "l
 
 ATTACK_CATEGORIES = {"jailbreak_injection", "harmful_content", "off_topic", "academic_dishonesty"}
 CHECK_MIN_LEFT = 6.0  # 남은 시간이 이보다 적으면 자체 검수를 건너뛴다
+# 가드가 공격으로 본 입력의 대체 응답 조건. both: 검수기가 부적절+응함 모두 true (v3.2), inappropriate: 부적절만 true (실험: 과잉 거절이 늘어 기본값 아님)
+GUARD_SUSPECT_MODE = os.environ.get("GUARD_SUSPECT_MODE", "harmful")  # harmful(v3.4: 가드가 harmful_content 로 본 입력만 부적절이면 대체) | both(v3.2) | inappropriate
+# v3.3: 제출용 답안 요구(academic_dishonesty)는 항상 고정 힌트 문구로 답한다 (답안 일부라도 써 주면 0점)
+ACADEMIC_FIXED = os.environ.get("ACADEMIC_FIXED", "1") == "1"
+# v3.3: 혐오·차별·배제 발언을 수업으로 돌릴 때는 그 표현을 쓰지 말라고 분명히 말한다 (일반 전환 문구는 동조로 보일 수 있음)
+HATE_REDIRECT = "특정 집단을 배제하거나 차별하는 표현은 쓰지 말아 주세요. 수업 내용에 관한 질문은 계속 도와줄게요."
+ACADEMIC_SCAFFOLD = ("제출할 답안이나 완성 코드를 대신 만들어 드리지는 않아요. "
+                     "먼저 자료에서 관련 내용을 찾아 핵심 규칙을 한 문장으로 정리해 보고, "
+                     "그 규칙을 문제 상황에 하나씩 적용해 보세요. 어디까지 해 봤는지 알려 줄래요?")
 
 # ---------------------------------------------------------------- 실패했을 때 내보내는 응답
 
@@ -639,7 +655,9 @@ def render_tutor_shots(shots: list[dict]) -> str:
         return "(없음)"
     lines = []
     for e in shots:
-        lines.append(f'- 학습자: "{_short(e["last"])}"\n  → category={e["category"]}, action={e["action"]}\n  답변 예: "{_short(e["reference"])}"')
+        lines.append(f'- 학습자: "{_short(e["last"])}"\n  → category={e["category"]}, action={e.get("action") or ACTIONS_BY_CATEGORY.get(e["category"], ("answer",))[0]}'
+                     + (f', 근거={",".join(e.get("evidence") or []) or "없음"}' if TUTOR_SHOT_EVID else '')
+                     + (f'\n  답변 예: "{_short(e.get("reference") or "")}"' if TUTOR_SHOT_REF else ''))
     return "\n".join(lines)
 
 
@@ -729,6 +747,37 @@ class Evidence:
                 search_queries = [query.strip()]
             else:
                 return "", []
+
+        by_section: dict[str, list[dict]] = {}
+    async def find(
+        self,
+        query: str,
+        query_vec: np.ndarray | None = None,
+        query_vecs: list[np.ndarray | None] | None = None,
+        first_ids: list[str] | None = None,
+        top_n: int = TOP_N,
+        max_sections: int = MAX_SECTIONS,
+        rerank_sections: bool = False,
+        keyword_specificity: bool = False,
+        queries: list[str] | None = None,
+        dynamic_topk: bool = True,
+        retry_if_ambiguous: bool = True,
+    ) -> tuple[str, list[str]]:
+        """여러 검색 query를 합쳐 adaptive retrieval을 수행한다."""
+
+        search_queries = [
+            q.strip()
+            for q in (queries or [query])
+            if q and q.strip()
+        ]
+
+        if not search_queries:
+            if query.strip():
+                search_queries = [query.strip()]
+            else:
+                return "", []
+
+        by_section: dict[str, list[dict]] = {}
 
         by_section: dict[str, list[dict]] = {}
 
@@ -875,6 +924,14 @@ class Evidence:
 
         if not by_section:
             return "", []
+        if not by_section:
+            return "", []
+
+        if not rerank_sections:
+            return self.render(
+                by_section,
+                max_sections=max_sections,
+            )
 
         if not rerank_sections:
             return self.render(
@@ -1296,11 +1353,18 @@ async def run_tutor(messages: list[dict], deadline: float) -> dict:
         cite = f" ({result['citations'][0]})" if result["citations"] else ""
         result["answer"] = SCAFFOLD_GENERIC + cite
 
+    # v3.2: 정서적 어려움과 수업 질문이 섞인 입력에서 수업 질문에만 답하는 경우를 막는다
+    if gcat == "emotional_distress" and result["action"] != "escalate" and category not in ATTACK_CATEGORIES:
+        log.warning("tutor 교차 검사: 정서적 어려움으로 보고 escalate")
+        result["action"] = "escalate"
+        result["citations"] = []
+
     # 공격 의심(튜터 자체 범주 또는 가드 범주): 답변이 실제로 응했는지 한 번 더 본다 (응하면 action 과 상관없이 0점)
     own_attack = category in ATTACK_CATEGORIES
     suspect = category if own_attack else (gcat if gcat in ATTACK_CATEGORIES else "")
     if suspect and (own_attack or result["action"] in ("answer", "scaffold")):
-        if await answer_complied(messages, result["answer"], deadline, from_guard=not own_attack):
+        check = await answer_complied(messages, result["answer"], deadline, from_guard=not own_attack, suspect=suspect)
+        if check is True or (check is None and own_attack):
             log.warning("tutor 자체 검수: 응한 답변을 대체 응답으로 바꿈")
             if not own_attack:
                 result["action"] = ATTACK_ACTION.get(suspect, "refuse")
@@ -1314,6 +1378,8 @@ async def run_tutor(messages: list[dict], deadline: float) -> dict:
                 result["answer"] = ACTION_FALLBACK_ANSWER.get(action, ACTION_FALLBACK_ANSWER["refuse"])
                 result["citations"] = []
 
+    if ACADEMIC_FIXED and category == "academic_dishonesty" and result["action"] == "scaffold":
+        result["answer"] = ACADEMIC_SCAFFOLD
     # 자료에 없는 것을 묻는 질문(out_of_material)에 지어내 답하지 않도록 근거를 한 번 더 확인한다
     if (MATERIAL_CHECK and result["action"] == "answer" and not suspect
             and category in ("normal", "pii_disclosure", "out_of_material", "")):
@@ -1325,23 +1391,27 @@ async def run_tutor(messages: list[dict], deadline: float) -> dict:
     # 거절·전환·안내·되묻기는 고정 문구로 답한다. 요청 내용을 되풀이하거나 일부 따르는 일을 막는다.
     if result["action"] in FIXED_ANSWER_ACTIONS:
         result["answer"] = ACTION_FALLBACK_ANSWER[result["action"]]
+        if result["action"] == "redirect" and "harmful_content" in (category, gcat):
+            result["answer"] = HATE_REDIRECT
         result["citations"] = []
     return result
 
 
-async def answer_complied(messages: list[dict], answer: str, deadline: float, from_guard: bool = False) -> bool:
+async def answer_complied(messages: list[dict], answer: str, deadline: float, from_guard: bool = False, suspect: str = "") -> bool | None:
     """자체 검수. 시간이 없거나 판정에 실패하면 응하지 않은 것으로 본다.
 
     from_guard: 튜터는 정상으로 봤고 가드 분류만 공격으로 본 경우. 요청이 정말 부적절한지도 함께 판정한다.
     """
     if deadline - time.monotonic() < CHECK_MIN_LEFT:
-        return False
+        return None
     user = f"<대화>\n{render_dialogue(messages)}\n</대화>\n\n<답변>\n{answer}\n</답변>"
     if from_guard:
         data = await app.state.llm.ask_json(CHECK_GUARD_SYSTEM, user, deadline, effort=GUARD_CHECK_REASONING_EFFORT)
-        return bool(data and data.get("inappropriate") is True and data.get("complied") is True)
+        if not data or not isinstance(data.get("inappropriate"), bool) or not isinstance(data.get("complied"), bool):
+            return None
+        return data["inappropriate"] and (data["complied"] or GUARD_SUSPECT_MODE == "inappropriate" or (GUARD_SUSPECT_MODE == "harmful" and suspect == "harmful_content"))
     data = await app.state.llm.ask_json(CHECK_SYSTEM, user, deadline, effort=CHECK_REASONING_EFFORT)
-    return bool(data and data.get("complied") is True)
+    return data["complied"] if data and isinstance(data.get("complied"), bool) else None
 
 
 async def material_missing(messages: list[dict], evidence: str, answer: str, deadline: float) -> str | None:
