@@ -52,6 +52,7 @@ RETRY_MIN_LEFT = 8.0       # 남은 시간이 이보다 적으면 LLM 을 다시
 LLM_CONCURRENCY = int(os.environ.get("LLM_CONCURRENCY", "64"))
 REASONING_EFFORT = os.environ.get("REASONING_EFFORT", "low")              # 튜터 답변
 GUARD_REASONING_EFFORT = os.environ.get("GUARD_REASONING_EFFORT", "medium")  # 가드 입력 분류
+GUARD_VOTES = int(os.environ.get("GUARD_VOTES", "1"))  # /guard 입력 분류 다수결 횟수
 GUARD_OUTPUT_REASONING_EFFORT = os.environ.get("GUARD_OUTPUT_REASONING_EFFORT", "low")  # 후보 답변 대조 (값 하나하나 비교)
 CHECK_REASONING_EFFORT = os.environ.get("CHECK_REASONING_EFFORT", "minimal")  # 튜터 자체 검수
 MAX_OUTPUT_TOKENS = 2000   # 대회 API는 스트리밍이 아닌 응답을 2000토큰까지만 받는다 (넘으면 400)
@@ -1413,19 +1414,57 @@ def looks_low_signal(text: str) -> bool:
     return bool(t) and not HANGUL_SYLLABLE_RE.search(t) and not WORD_RE.search(t)
 
 
-async def guard_input(messages: list[dict], deadline: float, qvec: np.ndarray | None) -> dict:
+async def guard_input(messages: list[dict], deadline: float, qvec: np.ndarray | None, votes: int = 1) -> dict:
     last = last_user(messages)
     if looks_low_signal(last):
         return {"decision": "allow", "category": "low_signal_input"}
-    shots = app.state.examples.nearest(qvec, GUARD_IN_SHOTS, exclude_last=last) if qvec is not None else []
-    user = f"<예시>\n{render_input_shots(shots)}\n</예시>\n\n<대화>\n{render_dialogue(messages)}\n</대화>"
-    data = await app.state.llm.ask_json(GUARD_INPUT_SYSTEM, user, deadline, effort=GUARD_REASONING_EFFORT)
-    cat = data.get("category") if data else None
-    cat = cat.strip().lower() if isinstance(cat, str) else ""
-    if cat not in CATEGORIES:
-        cat = "normal"
-    return {"decision": "block" if cat in BLOCK_CATEGORIES else "allow", "category": cat}
 
+    shots = app.state.examples.nearest(
+        qvec,
+        GUARD_IN_SHOTS,
+        exclude_last=last
+    ) if qvec is not None else []
+
+    user = (
+        f"<예시>\n{render_input_shots(shots)}\n</예시>\n\n"
+        f"<대화>\n{render_dialogue(messages)}\n</대화>"
+    )
+
+    datas = await asyncio.gather(*[
+        app.state.llm.ask_json(
+            GUARD_INPUT_SYSTEM,
+            user,
+            deadline,
+            effort=GUARD_REASONING_EFFORT
+        )
+        for _ in range(max(1, votes))
+    ])
+
+    cats = []
+
+    for data in datas:
+        c = data.get("category") if data else None
+        c = c.strip().lower() if isinstance(c, str) else ""
+
+        if c in CATEGORIES:
+            cats.append(c)
+
+    cat = (
+        max(
+            set(cats),
+            key=lambda c: (
+                cats.count(c),
+                -cats.index(c)
+            )
+        )
+        if cats
+        else "normal"
+    )
+
+    return {
+        "decision": "block" if cat in BLOCK_CATEGORIES else "allow",
+        "category": cat
+    }
 
 async def guard_output(messages: list[dict], candidate: str, deadline: float, qvec: np.ndarray | None,
                        input_result: dict | None = None) -> dict:
@@ -1475,7 +1514,7 @@ async def run_guard(messages: list[dict], candidate: str | None, deadline: float
     if not messages:
         return guard_fallback(candidate is not None)
     qvec = await embed_or_none(context_text(messages))
-    inp = await guard_input(messages, deadline, qvec)
+    inp = await guard_input(messages, deadline, qvec, votes=GUARD_VOTES)
     if candidate is None:
         return {"input": inp}
     # 입력 판정을 먼저 끝내고 그 범주를 후보 답변 판정에 넘긴다 (차단 대상 요청에 응한 답변 = unsafe)
