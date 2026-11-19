@@ -49,7 +49,7 @@ PUBLIC_DIR = os.environ.get("PUBLIC_DIR", "public")
 REQUEST_BUDGET = 25.0      # 요청 하나의 전체 제한(초). 채점기 제한 30초보다 짧게 잡는다
 LLM_TIMEOUT = 17.0         # LLM 시도 한 번의 제한(초)
 RETRY_MIN_LEFT = 8.0       # 남은 시간이 이보다 적으면 LLM 을 다시 부르지 않는다
-LLM_CONCURRENCY = int(os.environ.get("LLM_CONCURRENCY", "64"))
+LLM_CONCURRENCY = int(os.environ.get("LLM_CONCURRENCY", "256"))
 REASONING_EFFORT = os.environ.get("REASONING_EFFORT", "low")              # 튜터 답변
 GUARD_REASONING_EFFORT = os.environ.get("GUARD_REASONING_EFFORT", "medium")  # 가드 입력 분류
 GUARD_VOTES = int(os.environ.get("GUARD_VOTES", "1"))  # /guard 입력 분류 다수결 횟수
@@ -536,6 +536,64 @@ async def embed_or_none(text: str) -> np.ndarray | None:
 
 # ---------------------------------------------------------------- /tutor
 
+SHOT_POOL = int(os.environ.get("SHOT_POOL", "24"))  # 예시 후보 수 (가까운 순)
+SHOT_CAP = int(os.environ.get("SHOT_CAP", "2"))  # 같은 action 예시 최대 개수. 0이면 끔
+QUOTE_K = int(os.environ.get("QUOTE_K", "2"))  # 답 뒤에 덧붙일 인용 섹션 원문 문장 수. 0이면 끔
+
+
+def diverse_shots(pool: list[dict]) -> list[dict]:
+    # 가까운 순 후보에서 같은 action 이 SHOT_CAP 개를 넘지 않게 TUTOR_SHOTS 개를 고른다
+    if SHOT_CAP <= 0:
+        return pool[:TUTOR_SHOTS]
+    picked: list[dict] = []
+    seen: dict[str, int] = {}
+    for e in pool:
+        a = e.get("action") or e.get("category") or ""
+        if seen.get(a, 0) >= SHOT_CAP:
+            continue
+        seen[a] = seen.get(a, 0) + 1
+        picked.append(e)
+        if len(picked) >= TUTOR_SHOTS:
+            return picked
+    for e in pool:  # 모자라면 가까운 순으로 채운다
+        if len(picked) >= TUTOR_SHOTS:
+            break
+        if not any(e is x for x in picked):
+            picked.append(e)
+    return picked
+
+
+def append_quotes(answer: str, sid: str, question: str) -> str:
+    # 인용 섹션 원문에서 질문과 가장 많이 겹치는 문장 QUOTE_K 개를 원래 순서대로 답 뒤에 그대로 붙인다
+    chunks = app.state.evidence.sections.get(sid) or []
+    sents: list[str] = []
+    for c in chunks:
+        for line in (c.get("text") or "").splitlines():
+            line = line.strip()
+            if not line or line.startswith(("#", "`", "|")):
+                continue
+            for t in _SENT_SPLIT_RE.split(line.lstrip("-*• ")):
+                t = t.strip()
+                if 10 <= len(t) <= 300 and t not in sents:
+                    sents.append(t)
+    if not sents:
+        return answer
+    # 질문과 겹치는 낱말(가중 1.0)과 답변과 겹치는 낱말(0.5)을 섹션 BM25 IDF 로 더한다. 흔한 낱말은 거의 안 세다
+    idf = getattr(app.state.evidence.sec_bm25, "idf", None) or {}
+    q = set(tokenize(question))
+    a = set(tokenize(SECTION_ID_RE.sub(" ", answer))) - q
+    def score(i: int) -> float:
+        st = set(tokenize(sents[i]))
+        return (sum(max(idf.get(t, 0.0), 0.0) for t in q & st)
+                + 0.5 * sum(max(idf.get(t, 0.0), 0.0) for t in a & st))
+    order = sorted(range(len(sents)), key=lambda i: (-score(i), i))
+    quote = " ".join(sents[i] for i in sorted(order[:QUOTE_K]) if sents[i] not in answer)
+    if not quote:
+        return answer
+    out = f"{answer}\n\n자료 원문: {quote}"
+    return out if len(out) <= ANSWER_LIMIT else answer
+
+
 async def run_tutor(messages: list[dict], deadline: float) -> dict:
     if not messages or not messages[-1]["content"].strip():
         return dict(TUTOR_FALLBACK)  # 내용이 없는 입력은 LLM 을 부르지 않고 되묻는다
@@ -544,7 +602,7 @@ async def run_tutor(messages: list[dict], deadline: float) -> dict:
         return {"answer": ACTION_FALLBACK_ANSWER["clarify"], "action": "clarify", "citations": []}
     ctx = context_text(messages)
     qvec = await embed_or_none(ctx)
-    shots = app.state.examples.nearest(qvec, TUTOR_SHOTS, exclude_last=last,
+    shots = app.state.examples.nearest(qvec, SHOT_POOL if SHOT_CAP > 0 else TUTOR_SHOTS, exclude_last=last,
                                           kind=None if TUTOR_SHOT_KIND == "all" else "tutor") if qvec is not None else []
     ex_ids: list[str] = []
     if TUTOR_SHOT_EVID:
@@ -553,6 +611,7 @@ async def run_tutor(messages: list[dict], deadline: float) -> dict:
             for sid in e.get("evidence") or []:
                 cnt[sid] = cnt.get(sid, 0) + 1
         ex_ids = sorted(cnt, key=lambda s: -cnt[s])[:EVID_EXTRA]
+    shots = diverse_shots(shots)
     try:
         evidence, ids = await app.state.evidence.find(search_query(messages), query_vec=qvec, extra_ids=ex_ids)
     except Exception as e:  # 검색이 실패해도 응대 방식은 정해야 한다
@@ -581,6 +640,7 @@ async def run_tutor(messages: list[dict], deadline: float) -> dict:
             log.warning("인용 재선택 실패: %s", type(e).__name__)
 
     # 가드 입력 분류(동시에 돌린 것)를 받아 튜터 판단과 교차 확인한다
+    llm_answer = result["answer"]
     gin = None
     if gin_task is not None:
         try:
@@ -646,6 +706,13 @@ async def run_tutor(messages: list[dict], deadline: float) -> dict:
         if result["action"] == "redirect" and "harmful_content" in (category, gcat):
             result["answer"] = HATE_REDIRECT
         result["citations"] = []
+    # 답·힌트를 LLM 이 쓴 그대로 내보낼 때만 인용 섹션 원문 문장을 덧붙인다 (고정 문구는 건드리지 않는다)
+    if (QUOTE_K > 0 and result["action"] in ("answer", "scaffold") and result["citations"]
+            and result["answer"] == llm_answer):
+        try:
+            result["answer"] = append_quotes(result["answer"], result["citations"][0], last)
+        except Exception as e:
+            log.warning("원문 덧붙이기 실패: %s", type(e).__name__)
     return result
 
 
@@ -834,7 +901,7 @@ async def run_guard(messages: list[dict], candidate: str | None, deadline: float
     if not messages:
         return guard_fallback(candidate is not None)
     qvec = await embed_or_none(context_text(messages))
-    mat_task = asyncio.create_task(guard_material(messages, deadline, qvec)) if GUARD_MATERIAL else None
+    mat_task = asyncio.create_task(guard_material(messages, deadline, qvec)) if (GUARD_MATERIAL and candidate is None) else None
     inp = await guard_input(messages, deadline, qvec, votes=GUARD_VOTES)
     if mat_task is not None:
         if inp.get("category") == "normal":
