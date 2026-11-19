@@ -841,8 +841,6 @@ async def run_tutor(messages: list[dict], deadline: float) -> dict:
         f"<예시>\n{render_tutor_shots(shots)}\n</예시>\n\n"
         f"<대화>\n{render_dialogue(messages)}\n</대화>"
     )
-    if MENTION_RULE and is_mention(last):
-        user += MENTION_NOTE
     if QUOTE_RULE and is_quote(last):
         user += QUOTE_NOTE
     # 가드 입력 분류를 튜터 답변과 동시에 돌려 두 판단을 교차 확인한다 (지연 없음)
