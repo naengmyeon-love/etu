@@ -478,27 +478,6 @@ def last_user(messages: list[dict]) -> str:
 
 
 DYNAMIC_CONTEXT = os.environ.get("DYNAMIC_CONTEXT", "0") == "1"
-SELECTIVE_EVIDENCE = os.environ.get("SELECTIVE_EVIDENCE", "0") == "1"
-SELECTIVE_GAP = float(os.environ.get("SELECTIVE_GAP", "0.08"))
-
-
-def evidence_verify_trigger(messages: list[dict], qvec: np.ndarray | None, ret_k: int) -> tuple[bool, str, float]:
-    """Cheap uncertainty gate: exact-value questions always verify; otherwise verify only on retrieval ambiguity."""
-    if ret_k <= 2:
-        return True, "exact", 0.0
-    try:
-        sec, _ = app.state.evidence.rank_sections(search_query(messages), qvec)
-        if len(sec) < 2:
-            return True, "few_sections", 0.0
-        top = np.sort(np.asarray(sec, dtype=np.float64))[-2:]
-        gap = float(top[-1] - top[-2])
-        if gap < SELECTIVE_GAP:
-            return True, "small_gap", gap
-        return False, "clear", gap
-    except Exception:
-        # If uncertainty cannot be measured, keep the safer verifier path.
-        return True, "measure_fail", 0.0
-
 
 def tutor_context_k(messages: list[dict]) -> int:
     # Tutor primary retrieval sections: exact=2, normal=3, complex/contextual=4.
@@ -894,20 +873,9 @@ async def run_tutor(messages: list[dict], deadline: float) -> dict:
         user += QUOTE_NOTE
     # 가드 입력 분류를 튜터 답변과 동시에 돌려 두 판단을 교차 확인한다 (지연 없음)
     gin_task = asyncio.create_task(guard_input(messages, deadline, qvec)) if TUTOR_CROSSCHECK else None
-    # (R3) 근거가 애매한 질문만 답 쓰기와 동시에 자료 충분성을 확인한다.
-    verify_pre = False
-    verify_reason = "off"
-    verify_gap = 0.0
-    if MATERIAL_CHECK and evidence:
-        if SELECTIVE_EVIDENCE:
-            verify_pre, verify_reason, verify_gap = evidence_verify_trigger(messages, qvec, ret_k)
-        else:
-            verify_pre = True
-            verify_reason = "legacy"
-    if SELECTIVE_EVIDENCE and verify_pre:
-        log.warning("selective_evidence precheck reason=%s k=%d gap=%.3f", verify_reason, ret_k, verify_gap)
+    # (P1) 자료에 있는 질문인지도 답 쓰기와 동시에 확인해 둔다
     mat_task = (asyncio.create_task(material_missing_q(messages, evidence, deadline))
-                if MATERIAL_CHECK and MATERIAL_PARALLEL and evidence and verify_pre else None)
+                if MATERIAL_CHECK and MATERIAL_PARALLEL and evidence else None)
     data = await app.state.llm.ask_json(TUTOR_SYSTEM, user, deadline, effort=REASONING_EFFORT)
     result = clean_tutor(data, ids)
     if result["action"] in ("answer", "scaffold") and result["citations"]:
@@ -990,24 +958,16 @@ async def run_tutor(messages: list[dict], deadline: float) -> dict:
 
     if ACADEMIC_FIXED and category == "academic_dishonesty" and result["action"] == "scaffold":
         result["answer"] = ACADEMIC_SCAFFOLD
-    # 자료에 없는 것을 묻는 질문에 지어내 답하지 않도록 근거를 확인한다.
-    # R3에서는 명확한 retrieval은 통과시키고, precheck 대상·out_of_material·무인용 답변만 추가 검증한다.
+    # 자료에 없는 것을 묻는 질문(out_of_material)에 지어내 답하지 않도록 근거를 한 번 더 확인한다
     if (MATERIAL_CHECK and result["action"] == "answer" and not suspect
             and category in ("normal", "pii_disclosure", "out_of_material", "")):
-        alt = None
-        need_verify = True
-        if SELECTIVE_EVIDENCE:
-            need_verify = (mat_task is not None or category == "out_of_material" or not result["citations"])
-        if need_verify:
-            if mat_task is not None:
-                try:
-                    alt = await mat_task
-                except Exception:
-                    alt = None
-            else:
-                if SELECTIVE_EVIDENCE:
-                    log.warning("selective_evidence postcheck category=%s citations=%d", category or "normal", len(result["citations"]))
-                alt = await material_missing(messages, evidence, result["answer"], deadline)
+        if mat_task is not None:
+            try:
+                alt = await mat_task
+            except Exception:
+                alt = None
+        else:
+            alt = await material_missing(messages, evidence, result["answer"], deadline)
         if alt:
             log.warning("tutor 근거 확인: 자료에 없는 질문으로 보고 abstain")
             result["action"] = "abstain"
