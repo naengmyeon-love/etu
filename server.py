@@ -1,4 +1,7 @@
-"""/tutor, /guard 서버 (v4.0).
+"""/tutor, /guard 서버 (v4.1).
+
+v4.1 = v4.0 + (T) 질문 속 규칙·기준·기능 이름이 지식 베이스 전체에 없으면 근거 확인·튜터 프롬프트에 참고 정보로 알린다.
+     교차 검증: action 정확도 0.914 → 0.938, 자료에 없는 질문 abstain 72% → 83%, 정상 질문 abstain 오판 2.7% → 2.3%.
 
 v4.0 = v3.9 + 정상 답변에 붙이는 인용 섹션 원문 문장 2→3개 (QUOTE_K_ANSWER).
      공개 세트를 반으로 나눈 교차 검증(한쪽 예시만 쓰고 다른 쪽으로 채점)에서 튜터 89.5 → 92.3.
@@ -1000,6 +1003,8 @@ async def run_tutor(messages: list[dict], deadline: float) -> dict:
     )
     if QUOTE_RULE and is_quote(last):
         user += QUOTE_NOTE
+    if TERM_HINT_TUTOR:
+        user += term_note(messages)
     study = MENTION_TUTOR and is_study_mention(last)
     if study and is_mention(last):
         user += MENTION_NOTE  # (V3) 탈옥 표현을 분석 대상으로 다루는 질문이라고 알려 준다
@@ -1202,11 +1207,58 @@ in_material=false 이면 abstain_answer 에 "자료에는 <질문이 묻는 것>
 JSON 객체 하나만 출력한다. {"in_material": true 또는 false, "abstain_answer": "<답>"}"""
 
 
+# (T) 질문 속 고유 용어(규칙·기준·기능 이름)가 지식 베이스 전체에 글자 그대로 있는지 본다 (런박스 안 검색).
+# 없으면 근거 확인기(튜터)에 참고 정보로만 알려 준다. 판단은 LLM 이 자료를 보고 한다. 규칙은 공개 세트 라벨만 보고 만들었다
+TERM_HINT = os.environ.get("TERM_HINT", "1") == "1"              # 근거 확인 프롬프트에 넣는다
+TERM_HINT_TUTOR = os.environ.get("TERM_HINT_TUTOR", "1") == "1"  # 튜터 답변 프롬프트에도 넣는다
+_TERM_SUF = r"(?:분류법|규칙|기준|법칙|원칙|공식|등급|지수|수수료|한도|점수표|체크리스트|테스트|모드|기능|제도|혜택)"
+_TERM_PAIR = re.compile(r"([가-힣A-Za-z0-9]+)\s*([가-힣]*" + _TERM_SUF + r")(?=[은는이가을를의에도로\s?.,!]|$)")
+_TERM_STOP = {"그럼", "그리고", "이", "그", "저", "어떤", "무슨", "이런", "그런", "우리", "내", "네", "아닌", "있는", "없는",
+              "같은", "다른", "새", "이번", "여기", "자료", "자료의", "수업", "수업의"}
+_TERM_MOD = re.compile(r"(?:는|을|를|은|인|한|된|할|던|지|고|서|면|요|야|게|도|에|의|가|이|에서|로)$")
+from pathlib import Path  # noqa: E402
+_KB_FLAT: str | None = None
+
+
+def _kb_flat() -> str:
+    """지식 베이스 전체 글(띄어쓰기·문장부호 제거). 서버를 띄울 때 한 번 만든다."""
+    global _KB_FLAT
+    if _KB_FLAT is None:
+        parts = [f.read_text(encoding="utf-8", errors="ignore") for f in sorted(Path(KB_DIR).rglob("*"))
+                 if f.is_file() and f.suffix in (".md", ".csv", ".html")]
+        _KB_FLAT = re.sub(r"[\s\W_]+", "", "".join(parts)).lower()
+    return _KB_FLAT
+
+
+def kb_missing_term(text: str) -> str | None:
+    """질문의 '○○ 규칙/기준/기능' 같은 이름이 지식 베이스에 없으면 그 이름을 돌려준다."""
+    kb = _kb_flat()
+    for m in _TERM_PAIR.finditer(text or ""):
+        a, b = m.group(1), m.group(2)
+        if a in _TERM_STOP or _TERM_MOD.search(a) or not re.search("[가-힣]", a):
+            continue
+        t = f"{a} {b}"
+        if kb and re.sub(r"[\s\W_]+", "", t).lower() not in kb:
+            return t
+    return None
+
+
+def term_note(messages: list[dict]) -> str:
+    t = kb_missing_term(last_user(messages))
+    if not t:
+        return ""
+    return (f"\n\n<용어확인>\n질문에 나온 '{t}'라는 이름은 지식 베이스 전체를 글자 그대로 찾아봐도 나오지 않는다. "
+            "자료에 그 이름의 규칙·기준·기능이 따로 정해져 있지 않을 가능성이 크다. "
+            "자료에 같은 뜻의 내용이 실제로 적혀 있는지 확인하고, 없으면 지어내지 않는다.\n</용어확인>")
+
+
 async def material_missing_q(messages: list[dict], evidence: str, deadline: float) -> str | None:
     """(P1) 답 없이 질문과 자료만 보고, 질문이 묻는 것이 자료에 없으면 abstain 답변을 돌려준다. 있으면(또는 판정 실패) None."""
     if not evidence:
         return None
     user = f"<자료>\n{evidence}\n</자료>\n\n<대화>\n{render_dialogue(messages)}\n</대화>"
+    if TERM_HINT:
+        user += term_note(messages)
     data = await app.state.llm.ask_json(MATERIAL_Q_SYSTEM, user, deadline, effort=MATERIAL_REASONING_EFFORT)
     if not data or data.get("in_material") is not False:
         return None
@@ -1221,6 +1273,8 @@ async def material_missing(messages: list[dict], evidence: str, answer: str, dea
         return None
     user = (f"<자료>\n{evidence}\n</자료>\n\n<대화>\n{render_dialogue(messages)}\n</대화>\n\n"
             f"<답변>\n{answer}\n</답변>")
+    if TERM_HINT:
+        user += term_note(messages)
     data = await app.state.llm.ask_json(MATERIAL_SYSTEM, user, deadline, effort=MATERIAL_REASONING_EFFORT)
     if not data or data.get("in_material") is not False:
         return None
@@ -1497,6 +1551,7 @@ async def lifespan(app: FastAPI):
     store = VectorStore.load_or_build(KB_DIR, INDEX_DIR)  # 색인은 여기서 끝낸다. 첫 요청에서 만들지 않는다
     app.state.evidence = _evidence_with_sentences(store)
     app.state.examples = ExampleIndex.load_or_build(PUBLIC_DIR, INDEX_DIR, os.environ.get("EMBEDDING_MODEL", ""))
+    _kb_flat()  # (T) 용어 확인용 지식 베이스 글도 미리 만든다
     app.state.llm = LLM()
     log.info("준비 완료: chunk %d개, 섹션 %d개, 예시 %d개, %.1f초",
              len(store.chunks), len(app.state.evidence.sections), len(app.state.examples.examples), time.time() - started)
