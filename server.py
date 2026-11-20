@@ -477,6 +477,49 @@ def last_user(messages: list[dict]) -> str:
     return ""
 
 
+DYNAMIC_CONTEXT = os.environ.get("DYNAMIC_CONTEXT", "0") == "1"
+SELECTIVE_EVIDENCE = os.environ.get("SELECTIVE_EVIDENCE", "0") == "1"
+SELECTIVE_GAP = float(os.environ.get("SELECTIVE_GAP", "0.08"))
+
+
+def evidence_verify_trigger(messages: list[dict], qvec: np.ndarray | None, ret_k: int) -> tuple[bool, str, float]:
+    """Cheap uncertainty gate: exact-value questions always verify; otherwise verify only on retrieval ambiguity."""
+    if ret_k <= 2:
+        return True, "exact", 0.0
+    try:
+        sec, _ = app.state.evidence.rank_sections(search_query(messages), qvec)
+        if len(sec) < 2:
+            return True, "few_sections", 0.0
+        top = np.sort(np.asarray(sec, dtype=np.float64))[-2:]
+        gap = float(top[-1] - top[-2])
+        if gap < SELECTIVE_GAP:
+            return True, "small_gap", gap
+        return False, "clear", gap
+    except Exception:
+        # If uncertainty cannot be measured, keep the safer verifier path.
+        return True, "measure_fail", 0.0
+
+
+def tutor_context_k(messages: list[dict]) -> int:
+    # Tutor primary retrieval sections: exact=2, normal=3, complex/contextual=4.
+    last = last_user(messages).strip().lower()
+    users = [m["content"].strip() for m in messages
+             if m["role"] == "user" and m["content"].strip()]
+
+    context_markers = ("아까", "앞에서", "이전", "방금", "그 예제", "그 값", "그거", "위에서")
+    multi_markers = ("비교", "차이", "각각", "공통점", "장단점", "둘 다", "모두 설명", "두 가지", "두개")
+    if (len(users) >= 2 and any(x in last for x in context_markers)) or any(x in last for x in multi_markers):
+        return 4
+
+    exact_markers = ("몇 ", "몇?", "몇점", "몇 점", "몇회", "몇 회", "최대", "최소",
+                     "범위", "순서", "이름", "출력", "결과", "인덱스", "무엇", "뭐야", "뭔가요")
+    exactish = ("`" in last) or any(x in last for x in exact_markers)
+    if exactish and len(last) <= 140:
+        return 2
+
+    return 3
+
+
 def render_dialogue(messages: list[dict]) -> str:
     """대화를 데이터로 표시해 넘긴다. 길면 최근 것만 남긴다."""
     lines, used = [], 0
@@ -668,20 +711,21 @@ class Evidence:
 
     async def find(self, query: str, query_vec: np.ndarray | None = None,
                    first_ids: list[str] | None = None, extra_ids: list[str] | None = None,
-                   new: bool = False) -> tuple[str, list[str]]:
+                   new: bool = False, max_sections: int | None = None) -> tuple[str, list[str]]:
         if not (new and NEW_RETRIEVAL and query.strip() and self.kw2 is not None):
             return await self._find_old(query, query_vec, first_ids, extra_ids)
+        limit = max(1, min(MAX_SECTIONS, max_sections if isinstance(max_sections, int) else MAX_SECTIONS))
         by_section: dict[str, list[dict]] = {}
         for sid in first_ids or []:
             if sid in self.sections:
                 by_section.setdefault(sid, [])
         sec, chunk = self.rank_sections(query, query_vec)
-        for i in np.argsort(-sec)[:MAX_SECTIONS]:
+        for i in np.argsort(-sec)[:limit]:
             sid = self.sec_ids[int(i)]
             top = sorted(self.sec_chunk_idx[sid], key=lambda j: -chunk[j])[:3]
             by_section.setdefault(sid, []).extend(self.store.chunks[j] for j in top)
         if extra_ids:  # v3.5: 비슷한 공개 문항의 근거 섹션을 후보에 더한다 (최대 2개, 청크 3개씩)
-            keys = list(by_section)[:MAX_SECTIONS]
+            keys = list(by_section)[:limit]
             for sid in extra_ids:
                 if sid in self.sections and sid not in keys:
                     keys.append(sid)
@@ -689,7 +733,7 @@ class Evidence:
                         top = sorted(self.sec_chunk_idx.get(sid, []), key=lambda j: -chunk[j])[:3]
                         by_section[sid] = [self.store.chunks[j] for j in top]
             return self.render({k: by_section.get(k, []) for k in keys}, max_sections=len(keys))
-        return self.render(by_section)
+        return self.render(by_section, max_sections=limit)
 
     async def _find_old(self, query: str, query_vec: np.ndarray | None = None,
                         first_ids: list[str] | None = None, extra_ids: list[str] | None = None) -> tuple[str, list[str]]:
@@ -830,8 +874,13 @@ async def run_tutor(messages: list[dict], deadline: float) -> dict:
             for sid in e.get("evidence") or []:
                 cnt[sid] = cnt.get(sid, 0) + 1
         ex_ids = sorted(cnt, key=lambda s: -cnt[s])[:EVID_EXTRA]
+    ret_k = tutor_context_k(messages) if DYNAMIC_CONTEXT else MAX_SECTIONS
+    if DYNAMIC_CONTEXT:
+        log.info("dynamic_context k=%d", ret_k)
     try:
-        evidence, ids = await app.state.evidence.find(search_query(messages), query_vec=qvec, extra_ids=ex_ids, new=True)
+        evidence, ids = await app.state.evidence.find(
+            search_query(messages), query_vec=qvec, extra_ids=ex_ids, new=True, max_sections=ret_k
+        )
     except Exception as e:  # 검색이 실패해도 응대 방식은 정해야 한다
         log.warning("검색 실패: %s", type(e).__name__)
         evidence, ids = "", []
@@ -845,9 +894,20 @@ async def run_tutor(messages: list[dict], deadline: float) -> dict:
         user += QUOTE_NOTE
     # 가드 입력 분류를 튜터 답변과 동시에 돌려 두 판단을 교차 확인한다 (지연 없음)
     gin_task = asyncio.create_task(guard_input(messages, deadline, qvec)) if TUTOR_CROSSCHECK else None
-    # (P1) 자료에 있는 질문인지도 답 쓰기와 동시에 확인해 둔다
+    # (R3) 근거가 애매한 질문만 답 쓰기와 동시에 자료 충분성을 확인한다.
+    verify_pre = False
+    verify_reason = "off"
+    verify_gap = 0.0
+    if MATERIAL_CHECK and evidence:
+        if SELECTIVE_EVIDENCE:
+            verify_pre, verify_reason, verify_gap = evidence_verify_trigger(messages, qvec, ret_k)
+        else:
+            verify_pre = True
+            verify_reason = "legacy"
+    if SELECTIVE_EVIDENCE and verify_pre:
+        log.warning("selective_evidence precheck reason=%s k=%d gap=%.3f", verify_reason, ret_k, verify_gap)
     mat_task = (asyncio.create_task(material_missing_q(messages, evidence, deadline))
-                if MATERIAL_CHECK and MATERIAL_PARALLEL and evidence else None)
+                if MATERIAL_CHECK and MATERIAL_PARALLEL and evidence and verify_pre else None)
     data = await app.state.llm.ask_json(TUTOR_SYSTEM, user, deadline, effort=REASONING_EFFORT)
     result = clean_tutor(data, ids)
     if result["action"] in ("answer", "scaffold") and result["citations"]:
@@ -930,16 +990,24 @@ async def run_tutor(messages: list[dict], deadline: float) -> dict:
 
     if ACADEMIC_FIXED and category == "academic_dishonesty" and result["action"] == "scaffold":
         result["answer"] = ACADEMIC_SCAFFOLD
-    # 자료에 없는 것을 묻는 질문(out_of_material)에 지어내 답하지 않도록 근거를 한 번 더 확인한다
+    # 자료에 없는 것을 묻는 질문에 지어내 답하지 않도록 근거를 확인한다.
+    # R3에서는 명확한 retrieval은 통과시키고, precheck 대상·out_of_material·무인용 답변만 추가 검증한다.
     if (MATERIAL_CHECK and result["action"] == "answer" and not suspect
             and category in ("normal", "pii_disclosure", "out_of_material", "")):
-        if mat_task is not None:
-            try:
-                alt = await mat_task
-            except Exception:
-                alt = None
-        else:
-            alt = await material_missing(messages, evidence, result["answer"], deadline)
+        alt = None
+        need_verify = True
+        if SELECTIVE_EVIDENCE:
+            need_verify = (mat_task is not None or category == "out_of_material" or not result["citations"])
+        if need_verify:
+            if mat_task is not None:
+                try:
+                    alt = await mat_task
+                except Exception:
+                    alt = None
+            else:
+                if SELECTIVE_EVIDENCE:
+                    log.warning("selective_evidence postcheck category=%s citations=%d", category or "normal", len(result["citations"]))
+                alt = await material_missing(messages, evidence, result["answer"], deadline)
         if alt:
             log.warning("tutor 근거 확인: 자료에 없는 질문으로 보고 abstain")
             result["action"] = "abstain"
