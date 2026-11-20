@@ -1121,6 +1121,7 @@ def looks_low_signal(text: str) -> bool:
 
 # ---------------------------------------------------------------- (BP) 경계 쌍 예시 실험
 BP = int(os.environ.get("BP", "2"))
+SELECTIVE_CHALLENGER = os.environ.get("SELECTIVE_CHALLENGER", "0") == "1"
 _BP_OUT = "[출력]\nJSON 객체 하나만 출력한다. {\"category\": \"<범주 이름>\"}"
 assert _BP_OUT in GUARD_INPUT_SYSTEM
 _BP_PAIR_NOTE = ("<경계예시>는 마지막 발화와 가장 비슷한 허용 예시 하나와 차단 예시 하나다. 겉모습이 비슷해도 판정이 갈리는 곳이니, "
@@ -1142,6 +1143,68 @@ if BP == 1:
     BP_SYSTEM = GUARD_INPUT_SYSTEM.replace(_BP_OUT, _BP_PAIR_NOTE + _BP_OUT)
 elif BP == 2:
     BP_SYSTEM = GUARD_INPUT_SYSTEM.replace(_BP_OUT, _BP_DEF + _BP_OUT)
+
+
+def guard_needs_challenger(inp: dict, last: str) -> bool:
+    cat = (inp or {}).get("category", "")
+    t = last.lower()
+
+    if cat == "academic_dishonesty":
+        cues = ("설명", "힌트", "검토", "점검", "수정", "오류", "왜", "어디가", "틀렸", "풀이 과정", "개념")
+        return any(x in t for x in cues)
+
+    if cat in ("jailbreak_injection", "harmful_content"):
+        cues = ("분석", "분류", "설명", "고쳐", "수정", "문제점", "예시", "인용", "문장", "왜 위험", "안전")
+        return any(x in t for x in cues)
+
+    if cat == "off_topic":
+        cues = ("수업", "실습", "강의", "과제", "문제", "프롬프트", "코드", "예제", "자료")
+        return any(x in t for x in cues)
+
+    return False
+
+
+CHALLENGER_SYSTEM = """너는 교육용 AI 튜터 가드레일의 재심사자다.
+첫 번째 분류기가 차단 범주로 본 요청 중, 학습·분석 의도가 섞여 경계가 애매한 경우만 다시 본다.
+
+판단 원칙:
+- 위험한 표현이 등장한다는 이유만으로 차단하지 않는다.
+- 분석·분류·설명·수정·비판·안전하게 바꾸려는 요청은 허용 범주일 수 있다.
+- 과제/시험의 완성 답안을 대신 만들어 달라는 요청은 academic_dishonesty다.
+- 자기 풀이·코드의 설명, 오류 점검, 힌트 요청은 academic_dishonesty가 아니다.
+- 수업/실습 자체가 프롬프트·글쓰기·코드 작업을 요구하면 단순히 형태가 일반 글쓰기라는 이유로 off_topic으로 보지 않는다.
+- 실제로 공격 문장·위험한 내용을 만들어 달라고 하거나 실행을 요구하면 해당 차단 범주를 유지한다.
+- 첫 번째 판정에 끌려가지 말고 실제 요청의 동작과 대상을 기준으로 독립적으로 재판정한다.
+
+반드시 기존 범주 이름 중 하나만 category로 출력한다.
+JSON 객체 하나만 출력한다. {"category":"<범주 이름>"}"""
+
+
+async def guard_challenger(messages: list[dict], deadline: float, qvec: np.ndarray | None, first: dict) -> dict | None:
+    last = last_user(messages)
+    if not guard_needs_challenger(first, last):
+        return None
+
+    context = bp_user(qvec, last, messages)
+    user = (
+        f"<첫판정>category={first.get('category','normal')}, "
+        f"decision={first.get('decision','allow')}</첫판정>\n\n"
+        f"{context}"
+    )
+    data = await app.state.llm.ask_json(
+        CHALLENGER_SYSTEM, user, deadline, effort=GUARD_REASONING_EFFORT
+    )
+    c = data.get("category") if isinstance(data, dict) else None
+    c = c.strip().lower() if isinstance(c, str) else ""
+    if c not in CATEGORIES:
+        return None
+
+    if MENTION_RULE and c == "jailbreak_injection" and is_mention(last):
+        c = "normal"
+    if QUOTE_RULE and c == "harmful_content" and is_quote(last):
+        c = "normal"
+
+    return {"decision": "block" if c in BLOCK_CATEGORIES else "allow", "category": c}
 
 
 def bp_user(qvec, last: str, messages: list[dict]) -> str:
@@ -1278,6 +1341,14 @@ async def run_guard(messages: list[dict], candidate: str | None, deadline: float
         spec_task = asyncio.create_task(guard_output(messages, candidate, deadline, qvec,
                                                      input_result={"decision": "allow", "category": "normal"}))
     inp = await guard_input(messages, deadline, qvec, votes=GUARD_VOTES)
+    if SELECTIVE_CHALLENGER and guard_needs_challenger(inp, last_user(messages)):
+        try:
+            challenged = await guard_challenger(messages, deadline, qvec, inp)
+        except Exception:
+            challenged = None
+        if challenged is not None:
+            log.warning("guard_challenger first=%s second=%s", inp.get("category"), challenged.get("category"))
+            inp = challenged
     if INPUT_RULES and inp.get("decision") == "allow":
         _last = last_user(messages)
         if is_academic(_last):
