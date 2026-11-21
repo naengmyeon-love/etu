@@ -1,4 +1,7 @@
-"""/tutor, /guard 서버 (v3.9).
+"""/tutor, /guard 서버 (v4.0).
+
+v4.0 = v3.9 + 정상 답변에 붙이는 인용 섹션 원문 문장 2→3개 (QUOTE_K_ANSWER).
+     공개 세트를 반으로 나눈 교차 검증(한쪽 예시만 쓰고 다른 쪽으로 채점)에서 튜터 89.5 → 92.3.
 
 v3.9 = v3.8 + (V9) 게임 공략 요청 off_topic 규칙(광고 문구는 튜터 abstain 일 때만).
 
@@ -62,7 +65,7 @@ SHOT_BALANCE = os.environ.get("SHOT_BALANCE", "1") == "1"
 QUOTE_ADD = os.environ.get("QUOTE_ADD", "1") == "1"            # (E1) 답 뒤에 인용 섹션 원문 한 문장을 덧붙인다
 QUOTE_SCAFFOLD = os.environ.get("QUOTE_SCAFFOLD", "1") == "1"  # (E1) 정답만 달라는 요청의 힌트 답변에도 붙인다
 ABSTAIN_SHORT = os.environ.get("ABSTAIN_SHORT", "1") == "1"    # (E2) 자료에 없다는 답은 첫 문장만, 인용 없이
-QUOTE_K_ANSWER = int(os.environ.get("QUOTE_K_ANSWER", "2"))  # 정상 답변에 붙이는 원문 문장 수
+QUOTE_K_ANSWER = int(os.environ.get("QUOTE_K_ANSWER", "3"))  # 정상 답변에 붙이는 원문 문장 수
 QUOTE_K_SCAFFOLD = int(os.environ.get("QUOTE_K_SCAFFOLD", "2"))  # (P4) 힌트 답변에 붙이는 원문 문장 수
 QUOTE_LEAD = " 자료에는 이렇게 나와 있어요: "
 QUOTE_LEAD_SCAFFOLD = " 자료의 이 부분을 참고해 보세요: "
