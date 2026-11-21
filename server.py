@@ -1,4 +1,6 @@
-"""/tutor, /guard 서버 (v3.8).
+"""/tutor, /guard 서버 (v3.9).
+
+v3.9 = v3.8 + (V9) 게임 공략 요청 off_topic 규칙(광고 문구는 튜터 abstain 일 때만).
 
 v3.8 = v3.7 + 공개 세트 문항별 진단(판정 모델 포함)으로 찾은 감점 지점 보완. 규칙은 공개 세트 라벨만 보고 만들었다.
      (V1) harmful_content 의 refuse/redirect: 방법·정보·글을 달라는 요청이면 refuse, 혐오·모욕 발언만 있으면 redirect
@@ -479,6 +481,38 @@ def is_mention(text: str) -> bool:
 
 
 OFFTOPIC_FROM_GUARD = os.environ.get("OFFTOPIC_FROM_GUARD", "1") == "1"  # (W1)
+# (V9) 게임 공략·이기는 법·랭크 같은 요청은 수업 무관(off_topic)이다. 수업 소재 이름이 섞여 있어도 마찬가지다.
+# 금융 과목의 게임 결제·아이템 거래·사기, 파이썬 실습의 숫자 맞히기·박수 게임처럼 수업 내용일 수 있는 말이 있으면 규칙으로 판단하지 않는다.
+OFFTOPIC_GAME = os.environ.get("OFFTOPIC_GAME", "1") == "1"
+OFF_GAME_RE = re.compile(
+    r"(?:게임|겜|game)[^\n]{0,30}?(?:공략|이기는\s*(?:법|방법)|이길\s*(?:전략|방법)|필승|랭크|레벨\s*업|숨는\s*위치|공격\s*거리|전략|꿀팁|치트)"
+    r"|(?:공략|필승|랭크\s*올리|이기는\s*(?:법|방법))[^\n]{0,20}?(?:게임|겜|game)",
+    re.IGNORECASE,
+)
+OFF_GAME_FOLLOW_RE = re.compile(r"공략|이기는\s*(?:법|방법)|필승|랭크|꿀팁|치트")
+OFF_GAME_LESSON_RE = re.compile(
+    r"결제|사기|거래|현금|충전|비밀번호|계정|부모|용돈|도박|스미싱|피싱|약속|확인"
+    r"|숫자\s*맞히기|업\s*다운|박수|실습|예제|코드|반복문|조건문|while|for\b|input|print",
+    re.IGNORECASE,
+)
+OFF_AD_RE = re.compile(r"(?:광고|홍보|판촉)\s*(?:문구|카피|멘트|글|포스터|전단)|slogan|슬로건|short\s*copy", re.IGNORECASE)
+OFF_MAKE_RE = re.compile(r"만들|써\s*줘|써\s*주|작성|지어|짜\s*줘|뽑아|write|make", re.IGNORECASE)
+
+def _offtopic_game(text: str) -> bool:
+    return bool(OFF_GAME_RE.search(text)) and not OFF_GAME_LESSON_RE.search(text)
+
+def is_offtopic_game_ctx(messages: list[dict]) -> bool:
+    """마지막 발화가 게임 공략 요청이거나, 직전 학습자 발화가 게임 공략 요청이고 이번에 그 공략을 다시 달라고 하면 True."""
+    users = [m["content"] for m in messages if m["role"] == "user"]
+    if not users or is_jailbreak(users[-1]):
+        return False
+    if _offtopic_game(users[-1]):
+        return True
+    return (len(users) >= 2 and _offtopic_game(users[-2]) and bool(OFF_GAME_FOLLOW_RE.search(users[-1]))
+            and not OFF_GAME_LESSON_RE.search(users[-1]))
+
+def is_ad_request(text: str) -> bool:
+    return bool(OFF_AD_RE.search(text)) and bool(OFF_MAKE_RE.search(text)) and not is_jailbreak(text)
 QUOTE_RULE = os.environ.get("QUOTE_RULE", "1") == "1"                    # (W2)
 QUOTE_RE = re.compile(r"(?:이)?라는\s*(?:가상\s*|차별\s*|혐오\s*)?(?:댓글|말|문장|문구|표현)")
 QUOTE_NOTE = ("\n\n<참고>\n마지막 발화는 어떤 문장을 인용해 놓고 그 문장을 분류·분석하는 방법을 묻는 수업 질문이다. "
@@ -1083,6 +1117,14 @@ async def run_tutor(messages: list[dict], deadline: float) -> dict:
     if OFFTOPIC_FROM_GUARD and result["action"] == "abstain" and gcat == "off_topic":
         log.debug("tutor 교차 검사: 수업 무관으로 보고 redirect")
         result["action"] = "redirect"
+    # (V9) 게임 공략·광고 문구 같은 수업 무관 요청에 '자료에 없다'고 하거나 답해 주려 하면 수업으로 돌린다
+    if (OFFTOPIC_GAME and result["action"] in ("abstain", "answer", "scaffold", "clarify")
+            and category not in ("jailbreak_injection", "harmful_content", "academic_dishonesty", "emotional_distress")
+            and (is_offtopic_game_ctx(messages) or (result["action"] == "abstain" and is_ad_request(last)))):
+        log.debug("tutor 입력 규칙: 게임 공략·광고 문구 요청으로 보고 redirect")
+        category = "off_topic"
+        result["action"] = "redirect"
+        result["citations"] = []
     # (V1) 유해 요청의 응대: 방법·정보·글을 달라고 하면 refuse, 혐오·모욕 발언만 있으면 redirect
     if (HARM_ACTION and result["action"] in ("refuse", "redirect") and "harmful_content" in (category, gcat)
             and category not in ("off_topic", "jailbreak_injection", "academic_dishonesty") and not is_jailbreak(last)):
@@ -1408,6 +1450,8 @@ async def run_guard(messages: list[dict], candidate: str | None, deadline: float
             inp = {"decision": "block", "category": "academic_dishonesty"}
         elif is_jailbreak(_last):
             inp = {"decision": "block", "category": "jailbreak_injection"}
+    if OFFTOPIC_GAME and inp.get("decision") == "allow" and is_offtopic_game_ctx(messages):
+        inp = {"decision": "block", "category": "off_topic"}  # (V9) 게임 공략 요청
     if EMO_RULE and inp.get("decision") == "allow" and is_emotional(last_user(messages)):
         inp = {"decision": "allow", "category": "emotional_distress"}  # (V2) 강한 위기 표현
     if GUARD_SUBTYPE and inp.get("category") == "normal":
